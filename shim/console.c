@@ -5,7 +5,7 @@
 #include "console.h"
 #include "font.h"
 
-#define SCALE		3
+#define SCALE		2	/* rain 720 px wide: 45 columns, as SCALE 3 gave on topaz's 1080 */
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24
