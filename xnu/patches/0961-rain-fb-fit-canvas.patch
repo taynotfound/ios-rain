@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 00:20:00 +0100
+Subject: [PATCH] rain-0961: sweetfb_fit scales the iPhone X canvas to the panel
+
+The Redmi 10C (rain) panel is 720x1650; the 1125x2436 iPhone X canvas was
+shown as a cropped centre window. Boot-arg sweetfb_fit=1 scales the canvas
+to the panel width (16/25 on rain: 720x1559, 45 px bars), bilinear, into
+the flip buffers, in both the direct and the multi-layer present paths.
+sweetfb_noshadow=1 now keeps the flip buffers (they allocate fine on rain)
+and only skips the fade and console shadow buffers. Off by default: topaz
+is unchanged.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -167,6 +167,11 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	/* rain: sweetfb_fit=1 scales the logical canvas to the panel width (letterboxed) */
++	bool          fFit;
++	uint32_t      fFitH, fFitTop;           /* scaled canvas height, black bar above it */
++	int32_t       fFitXs[1088];             /* per panel column: source x */
++	uint16_t      fFitXf[1088];             /* per panel column: x weight (0..256) */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -336,6 +341,16 @@
+ 	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	{
++		uint32_t fit = 0;
++		PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++		fFitH = (uint32_t)(((uint64_t)fLogicalH * fWidth) / fLogicalW);
++		fFit = fit != 0 && fLogicalW > fWidth && fWidth <= 1088 && fFitH <= fHeight;
++		fFitTop = fFit ? (fHeight - fFitH) / 2 : 0;
++		if (fFit) {
++			IOLog("RAIN FB: fit %ux%u -> %ux%u at y %u\n", fLogicalW, fLogicalH, fWidth, fFitH, fFitTop);
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -421,7 +436,7 @@
+ 		uint32_t noshadow = 0;      /* rain: boot-arg sweetfb_noshadow=1 skips flip/shadow buffers */
+ 		PE_parse_boot_argn("sweetfb_noshadow", &noshadow, sizeof(noshadow));
+ 		IOLog("RAIN FB: step1 geometry set, fsz %lu noshadow %u\n", (unsigned long)fsz, noshadow);
+-		for (int i = 0; i < 2 && !noshadow; i++) {
++		for (int i = 0; i < 2; i++) {
+ 			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -431,7 +446,7 @@
+ 		IOLog("RAIN FB: step3 fade buffer %p\n", fFadeOrig);
+ 		fCons = noshadow ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+-		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
++		if (fFlip[0] == NULL || fFlip[1] == NULL || (fFadeOrig == NULL && !noshadow)) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+ 			OSSafeReleaseNULL(fFlip[1]);
+ 			OSSafeReleaseNULL(fFadeOrig);
+@@ -1246,6 +1261,82 @@
+  * presented by pointing the MDP at it (no 10 MB CPU copy). Returns false to
+  * fall back to the copy path.
+  */
++/* RAIN-FIT-BEGIN */
++/*
++ * rain: scale a rectangle of the logical canvas (lx,ly,lw,lh; its pixels start
++ * at src + sy*stride + sx*4) into the panel at the canvas-to-panel width ratio,
++ * bilinear, BGRA. Panel rows are offset by top. xs/xf: scratch of panelW entries.
++ */
++static inline uint32_t
++sweet_fit_lerp(uint32_t a, uint32_t b, uint32_t f)
++{
++	uint32_t rb = ((a & 0x00ff00ffu) * (256u - f) + (b & 0x00ff00ffu) * f) >> 8;
++	uint32_t ag = (((a >> 8) & 0x00ff00ffu) * (256u - f) + ((b >> 8) & 0x00ff00ffu) * f) >> 8;
++	return (rb & 0x00ff00ffu) | ((ag & 0x00ff00ffu) << 8);
++}
++
++static void
++sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH, uint32_t top,
++    uint32_t logicalW, const uint8_t *src, uint32_t stride, int32_t sx, int32_t sy,
++    int32_t lx, int32_t ly, int32_t lw, int32_t lh, int32_t *xs, uint16_t *xf)
++{
++	if (lw <= 0 || lh <= 0 || panelW == 0 || logicalW == 0) {
++		return;
++	}
++	/* panel pixels whose centres fall inside the logical rectangle */
++	int64_t px0 = ((int64_t)lx * panelW + logicalW - 1) / logicalW;
++	int64_t px1 = ((int64_t)(lx + lw) * panelW + logicalW - 1) / logicalW;
++	int64_t py0 = ((int64_t)ly * panelW + logicalW - 1) / logicalW;
++	int64_t py1 = ((int64_t)(ly + lh) * panelW + logicalW - 1) / logicalW;
++	if (px0 < 0) {
++		px0 = 0;
++	}
++	if (py0 < 0) {
++		py0 = 0;
++	}
++	if (px1 > (int64_t)panelW) {
++		px1 = panelW;
++	}
++	if (py1 > (int64_t)fitH) {
++		py1 = fitH;
++	}
++	/* logical coordinate of a panel pixel centre, in 1/256 px: (2p+1)*L*128/P - 128 */
++	for (int64_t px = px0; px < px1; px++) {
++		int64_t u = ((2 * px + 1) * (int64_t)logicalW * 128) / panelW - 128 - (int64_t)lx * 256;
++		if (u < 0) {
++			u = 0;
++		}
++		if (u > (int64_t)(lw - 1) * 256) {
++			u = (int64_t)(lw - 1) * 256;
++		}
++		xs[px] = (int32_t)(u >> 8);
++		xf[px] = (uint16_t)(xs[px] + 1 < lw ? (u & 255) : 0);
++	}
++	for (int64_t py = py0; py < py1; py++) {
++		int64_t v = ((2 * py + 1) * (int64_t)logicalW * 128) / panelW - 128 - (int64_t)ly * 256;
++		if (v < 0) {
++			v = 0;
++		}
++		if (v > (int64_t)(lh - 1) * 256) {
++			v = (int64_t)(lh - 1) * 256;
++		}
++		int32_t y0 = (int32_t)(v >> 8);
++		uint32_t fy = y0 + 1 < lh ? (uint32_t)(v & 255) : 0;
++		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + y0) * stride) + sx;
++		const uint32_t *r1 = fy ? (const uint32_t *)((const uint8_t *)r0 + stride) : r0;
++		uint32_t *out = (uint32_t *)(dst + (uint64_t)(top + py) * dstStride);
++		for (int64_t px = px0; px < px1; px++) {
++			int32_t x = xs[px];
++			uint32_t fx = xf[px];
++			int32_t x1 = fx ? x + 1 : x;
++			uint32_t t = sweet_fit_lerp(r0[x], r0[x1], fx);
++			uint32_t b = fy ? sweet_fit_lerp(r1[x], r1[x1], fx) : t;
++			out[px] = fy ? sweet_fit_lerp(t, b, fy) : t;
++		}
++	}
++}
++/* RAIN-FIT-END */
++
+ bool
+ AppleCLCD::directPresent(const uint8_t *rec)
+ {
+@@ -1268,6 +1359,26 @@
+ 	}
+ 	bool ok = false;
+ 	(void)topaz_surface_drawn(s, 100);
++	if (fFit && fFlip[0] != NULL && s->bytesPerElement == 4 && s->elementWidth == 1 &&
++	    s->width == fLogicalW && s->height == fLogicalH && s->memory != NULL &&
++	    (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow <= s->memory->getLength()) {
++		uintptr_t va = s->kernelAddress();
++		if (va != 0) {
++			uint8_t *dst = backBuffer();
++			bzero(dst, (size_t)fFitTop * fRowBytes);
++			bzero(dst + (uint64_t)(fFitTop + fFitH) * fRowBytes, (size_t)(fHeight - fFitTop - fFitH) * fRowBytes);
++			sweet_fit_blit(dst, fRowBytes, fWidth, fFitH, fFitTop, fLogicalW,
++			    (const uint8_t *)(va + s->offset), s->bytesPerRow, 0, 0, 0, 0,
++			    (int32_t)fLogicalW, (int32_t)fLogicalH, fFitXs, fFitXf);
++			flipBack();
++			IOLockLock(fLock);
++			fLastVA = NULL;         /* panel-sized copies (fade) read the flip buffer */
++			IOLockUnlock(fLock);
++			ok = true;
++		}
++		s->release();
++		return ok;
++	}
+ 	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width >= fWidth && s->height >= fHeight) {
+ 		/* full-screen surface: panel window at the logical offset */
+@@ -1349,6 +1460,11 @@
+ 	 * framebuffer showed every multi-layer frame (dims, apps) drawn top-down.
+ 	 */
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
++	bool fit = fFit && fFlip[0] != NULL;
++	if (fit) {
++		bzero(dst, (size_t)fFitTop * fRowBytes);
++		bzero(dst + (uint64_t)(fFitTop + fFitH) * fRowBytes, (size_t)(fHeight - fFitTop - fFitH) * fRowBytes);
++	}
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+ 	}
+@@ -1400,6 +1516,22 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fit) {
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h) * s->bytesPerRow;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 && s->elementHeight == 1 &&
++			    s->memory != NULL && end <= s->memory->getLength()) {
++				sweet_fit_blit(dst, fRowBytes, fWidth, fFitH, fFitTop, fLogicalW,
++				    (const uint8_t *)(src + s->offset), s->bytesPerRow, sx, sy, dx, dy, w, h, fFitXs, fFitXf);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
