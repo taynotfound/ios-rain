@@ -91,6 +91,12 @@ const char *loader_boot(uintptr_t dtb)
 		con_hex2("DDR MiB", "at=", (uint32_t)(mb[i] >> 20), "size=", (uint32_t)(ms[i] >> 20));
 	if (!nmem)
 		con_str("DDR", "no /memory in DTB");
+	/* rain: which panel ABL found decides the touch chip (TDDI: Novatek or FocalTech) */
+	char panel[40];
+	con_str("PANEL", fdt_bootarg(dtb, "dsi_display0=", panel, sizeof(panel)) ? panel : "not in bootargs");
+	char tp[40];
+	if (fdt_bootarg(dtb, "touch_", tp, sizeof(tp)))
+		con_str("TOUCH", tp);
 
 	/*
 	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot

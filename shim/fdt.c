@@ -87,6 +87,62 @@ int fdt_memory(uintptr_t fdt, uint64_t *base, uint64_t *size, int max)
 	}
 }
 
+/*
+ * Find needle in /chosen bootargs and copy what follows it (up to a space or
+ * comma) into out. Returns 1 if found.
+ */
+int fdt_bootarg(uintptr_t fdt, const char *needle, char *out, int outlen)
+{
+	if (!fdt || be32(fdt) != FDT_MAGIC || outlen < 1)
+		return 0;
+	uintptr_t p = fdt + be32(fdt + 8);
+	uintptr_t strings = fdt + be32(fdt + 12);
+	int depth = 0, in_chosen = 0;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE:
+			depth++;
+			in_chosen = depth == 2 && streq((const char *)p, "chosen");
+			p = align4(skip_str(p));
+			break;
+		case FDT_END_NODE:
+			if (in_chosen)
+				return 0;
+			depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			if (in_chosen && streq((const char *)(strings + nameoff), "bootargs")) {
+				const volatile char *s = (const volatile char *)val;
+				for (uint32_t i = 0; i < len && s[i]; i++) {
+					uint32_t k = 0;
+					while (needle[k] && i + k < len && s[i + k] == needle[k])
+						k++;
+					if (needle[k])
+						continue;
+					int n = 0;
+					for (uint32_t j = i + k; j < len && s[j] && s[j] != ' ' && s[j] != ',' && n < outlen - 1; j++)
+						out[n++] = s[j];
+					out[n] = 0;
+					return 1;
+				}
+				return 0;
+			}
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return 0;
+		}
+	}
+}
+
 int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 {
 	if (!fdt || be32(fdt) != FDT_MAGIC)
