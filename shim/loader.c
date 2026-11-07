@@ -84,6 +84,14 @@ const char *loader_boot(uintptr_t dtb)
 	uint64_t rd_start, rd_end;
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
+	/* rain: DDR banks as ABL reports them, in MiB, to size the ADT memory range */
+	uint64_t mb[6], ms[6];
+	int nmem = fdt_memory(dtb, mb, ms, 6);
+	for (int i = 0; i < nmem; i++)
+		con_hex2("DDR MiB", "at=", (uint32_t)(mb[i] >> 20), "size=", (uint32_t)(ms[i] >> 20));
+	if (!nmem)
+		con_str("DDR", "no /memory in DTB");
+
 	/*
 	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot
 	 * image, so the payload rides behind the shim in the kernel Image.
