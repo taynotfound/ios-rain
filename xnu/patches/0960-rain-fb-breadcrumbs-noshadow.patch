@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 7 Nov 2026 22:45:00 +0100
+Subject: [PATCH] rain-0960: AppleCLCD start breadcrumbs, sweetfb_noshadow
+
+Redmi 10C (rain): AppleCLCD::start hangs between "direct scanout ready"
+and "console double buffered". Log each step of the flip/shadow buffer
+setup, and add boot-arg sweetfb_noshadow=1 to skip that block (the
+NULL-buffer path the code already takes when allocation fails).
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -418,13 +418,18 @@
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+-		for (int i = 0; i < 2; i++) {
++		uint32_t noshadow = 0;      /* rain: boot-arg sweetfb_noshadow=1 skips flip/shadow buffers */
++		PE_parse_boot_argn("sweetfb_noshadow", &noshadow, sizeof(noshadow));
++		IOLog("RAIN FB: step1 geometry set, fsz %lu noshadow %u\n", (unsigned long)fsz, noshadow);
++		for (int i = 0; i < 2 && !noshadow; i++) {
+ 			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 		}
+-		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+-		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		IOLog("RAIN FB: step2 flip buffers %#llx %#llx\n", fFlipPhys[0], fFlipPhys[1]);
++		fFadeOrig = noshadow ? NULL : IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
++		IOLog("RAIN FB: step3 fade buffer %p\n", fFadeOrig);
++		fCons = noshadow ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+@@ -434,12 +439,16 @@
+ 		}
+ 		if (fCons != NULL) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
++			IOLog("RAIN FB: step4 shadow %p, copying boot frame\n", c);
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
++			IOLog("RAIN FB: step5 copied\n");
+ 			sweet_dcache_clean((vm_offset_t)(uintptr_t)c, (unsigned)fsz);   /* for panics */
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
++			IOLog("RAIN FB: step6 retarget console\n");
+ 			sweet_console_retarget((vm_offset_t)c);
++			IOLog("RAIN FB: step7 retargeted, flipping\n");
+ 			fConsShown = true;
+ 			flipFrom(c, fRowBytes);
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
