@@ -93,7 +93,8 @@ const char *loader_boot(uintptr_t dtb)
 		con_str("DDR", "no /memory in DTB");
 	/* rain: which panel ABL found decides the touch chip (TDDI: Novatek or FocalTech) */
 	char panel[40];
-	con_str("PANEL", fdt_bootarg(dtb, "dsi_display0=", panel, sizeof(panel)) ? panel : "not in bootargs");
+	con_str("PANEL", fdt_bootarg(dtb, "dsi_display0=qcom,mdss_dsi_panel_", panel, sizeof(panel)) ||
+		fdt_bootarg(dtb, "dsi_display0=qcom,mdss_dsi_", panel, sizeof(panel)) ? panel : "not in bootargs");
 	char tp[40];
 	if (fdt_bootarg(dtb, "touch_", tp, sizeof(tp)))
 		con_str("TOUCH", tp);

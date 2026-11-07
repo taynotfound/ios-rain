@@ -125,7 +125,7 @@ int fdt_bootarg(uintptr_t fdt, const char *needle, char *out, int outlen)
 					if (needle[k])
 						continue;
 					int n = 0;
-					for (uint32_t j = i + k; j < len && s[j] && s[j] != ' ' && s[j] != ',' && n < outlen - 1; j++)
+					for (uint32_t j = i + k; j < len && s[j] && s[j] != ' ' && s[j] != ',' && s[j] != ':' && n < outlen - 1; j++)
 						out[n++] = s[j];
 					out[n] = 0;
 					return 1;
