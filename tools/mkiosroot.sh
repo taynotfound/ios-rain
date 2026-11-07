@@ -65,7 +65,20 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# Newer rsync (3.4+) tries chmod on symlinks, which Linux cannot do (EOPNOTSUPP)
+	# and reports exit 23. Accept 23 only when every error is that one.
+	local log rc=0
+	log=$(mktemp)
+	sudo rsync -aH --numeric-ids "$1/" "$2/" 2> >(tee "$log" >&2) || rc=$?
+	sleep 1	# let tee flush
+	# (rsync's own closing "some files/attrs were not transferred (code 23)" line is expected too)
+	if [[ $rc == 23 ]] && ! grep -v -e 'failed to set permissions on .*Operation not supported (95)' \
+	    -e 'some files/attrs were not transferred (see previous errors) (code 23)' "$log" | grep -q .; then
+		echo "rsync: $(wc -l < "$log") symlink permission warnings ignored"
+		rc=0
+	fi
+	rm -f "$log"
+	return $rc
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
