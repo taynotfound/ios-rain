@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 01:20:00 +0100
+Subject: [PATCH] rain-0963: touch stage A2, snapshot the SE at the first failed SPI command
+
+On the phone the first SPI command (3-byte TX_ONLY) never reported
+M_CMD_DONE. Record M/S IRQ status, GENI status, FIFO status and GENI_IOS
+at the first failure, cancel the M command afterwards, and read back the
+SPI configuration (clock, word length, CPHA/CPOL, demux, trans cfg, CGC,
+DMA mode, packing) for the panic report.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -649,8 +649,29 @@
+ 	unsigned xfers;
+ 	uint8_t id[6], id_old[6];
+ 	const char *stage;
++	/* 0963: engine state at the first failed command, SPI config read back */
++	bool snapped;
++	uint32_t f_op, f_n, f_irq, f_status, f_txfs, f_rxfs, f_ios, f_sirq;
++	uint32_t c_mclk, c_clksel, c_word, c_cpha, c_cpol, c_demux, c_trans, c_cgc, c_dma, c_pack0;
+ } rn;
+ 
++static void
++rain_snap(uint32_t op, unsigned n)
++{
++	if (rn.snapped) {
++		return;
++	}
++	rn.snapped = true;
++	rn.f_op = op;
++	rn.f_n = n;
++	rn.f_irq = touch_rd(rn.se, SE_IRQ);
++	rn.f_status = touch_rd(rn.se, SE_STATUS);
++	rn.f_txfs = touch_rd(rn.se, SE_TX_COUNT);
++	rn.f_rxfs = touch_rd(rn.se, SE_RX_COUNT);
++	rn.f_ios = touch_rd(rn.se, 0x908);         /* GENI_IOS: pin levels seen by the SE */
++	rn.f_sirq = touch_rd(rn.se, 0x640);        /* S engine IRQ status */
++}
++
+ /* One SPI command of n (<= 32) bytes, chip select held for the whole command. */
+ static int
+ rain_spi(uint32_t op, const uint8_t *tx, uint8_t *rx, unsigned n)
+@@ -683,6 +704,7 @@
+ 			}
+ 		}
+ 		if (irq & SE_ERRORS & ~SE_NACK) {
++			rain_snap(op, n);
+ 			touch_wr(se, SE_IRQ_CLR, 0xffffffffu);
+ 			return -3;
+ 		}
+@@ -693,6 +715,9 @@
+ 		}
+ 		delay(1);
+ 	}
++	rain_snap(op, n);
++	touch_wr(se, SE_CTRL, 4);           /* M cancel so the engine is idle again */
++	delay(1000);
+ 	return -4;                          /* timeout */
+ }
+ 
+@@ -812,6 +837,17 @@
+ 	touch_wr(rn.se, 0x810, 0);
+ 	touch_wr(rn.se, 0x814, ((rn.hwrx >> 16) & 0x3fu) - 1u);
+ 	touch_wr(rn.se, SE_IRQ_EN, SE_EVENTS);
++	rn.c_mclk = touch_rd(rn.se, SE_MCLK);
++	rn.c_clksel = touch_rd(rn.se, SE_CLK_SEL);
++	rn.c_word = touch_rd(rn.se, RAIN_SPI_WORDLEN);
++	rn.c_cpha = touch_rd(rn.se, RAIN_SPI_CPHA);
++	rn.c_cpol = touch_rd(rn.se, RAIN_SPI_CPOL);
++	rn.c_demux = touch_rd(rn.se, RAIN_SPI_DEMUXSEL);
++	rn.c_trans = touch_rd(rn.se, RAIN_SPI_TRANSCFG);
++	rn.c_cgc = touch_rd(rn.se, 0x28);
++	rn.c_dma = touch_rd(rn.se, SE_DMA);
++	rn.c_pack0 = touch_rd(rn.se, 0x260);
++	rn.cbcr = touch_rd(st.gcc, RAIN_RCG_SE0 - 4u);   /* branch state after the wait */
+ 
+ 	rn.stage = "nvt reset";
+ 	int e = rain_nvt_write(RAIN_NVT_RST, 0x69);
+@@ -833,15 +869,14 @@
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH A: stage '%s' err=%d xfers=%u | gcc vote=%#x cfg=%#x cbcr=%#x | "
+-	    "se0 fw=%#x status=%#x hwtx=%#x hwrx=%#x | gpio0-3 %#x %#x %#x %#x -> %#x %#x %#x %#x | "
+-	    "id@3f004 %02x %02x %02x %02x %02x %02x | id@1f64e %02x %02x %02x %02x %02x %02x",
+-	    rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.vote, rn.rcgcfg, rn.cbcr,
+-	    rn.fw, rn.status, rn.hwtx, rn.hwrx,
+-	    rn.pin_before[0], rn.pin_before[1], rn.pin_before[2], rn.pin_before[3],
+-	    rn.pin_after[0], rn.pin_after[1], rn.pin_after[2], rn.pin_after[3],
+-	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5],
+-	    rn.id_old[0], rn.id_old[1], rn.id_old[2], rn.id_old[3], rn.id_old[4], rn.id_old[5]);
++	panic("RAIN TOUCH A2: '%s' err=%d xf=%u cbcr=%#x | FAIL op=%u n=%u irq=%#x st=%#x "
++	    "txfs=%#x rxfs=%#x ios=%#x sirq=%#x | CFG mclk=%#x sel=%#x word=%#x cpha=%#x cpol=%#x "
++	    "demux=%#x trans=%#x cgc=%#x dma=%#x pack=%#x | id %02x %02x %02x %02x %02x %02x",
++	    rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.cbcr,
++	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs, rn.f_rxfs, rn.f_ios, rn.f_sirq,
++	    rn.c_mclk, rn.c_clksel, rn.c_word, rn.c_cpha, rn.c_cpol, rn.c_demux, rn.c_trans,
++	    rn.c_cgc, rn.c_dma, rn.c_pack0,
++	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5]);
+ }
+ 
+ static void
