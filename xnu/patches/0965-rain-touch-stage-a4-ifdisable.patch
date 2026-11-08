@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 01:55:00 +0100
+Subject: [PATCH] rain-0965: touch stage A4, check GENI_IF_DISABLE_RO before SPI
+
+SE0 clocks match the working SE2, yet the first FIFO-mode SPI command
+hangs with its TX FIFO drained. Read GENI_IF_DISABLE_RO (0x64): with
+FIFO_IF_DISABLE set the engine only works through GPI DMA (Linux
+spi-geni-qcom switches to GENI_GPI_DMA then). Stop before any command
+in that case, and report the flag, S firmware revision and FORCE_DEFAULT.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -656,6 +656,8 @@
+ 	/* 0964: clock tree evidence and a forced-root retry */
+ 	uint32_t k_cmd, k_b138, k_b144, k_se2cmd, k_se2cfg, k_cmd2;
+ 	int retry_err;
++	/* 0965: interface flags, read before any SPI command */
++	uint32_t ifdis, fws, proto_s, seqcfg;
+ } rn;
+ 
+ static void
+@@ -790,6 +792,9 @@
+ 	rn.hwtx = touch_rd(rn.se, SE_HW_TX);
+ 	rn.hwrx = touch_rd(rn.se, SE_HW_RX);
+ 	rn.status = touch_rd(rn.se, SE_STATUS);
++	rn.ifdis = touch_rd(rn.se, 0x64);        /* GENI_IF_DISABLE_RO: bit 0 FIFO_IF_DISABLE */
++	rn.fws = touch_rd(rn.se, 0x6c);          /* GENI_S_FW_REVISION_RO */
++	rn.seqcfg = touch_rd(rn.se, 0x20);       /* GENI_FORCE_DEFAULT as left by ABL */
+ 	if (((rn.fw >> 8) & 0xffu) != 1u) {
+ 		rn.err = -13;                   /* not SPI firmware: touch nothing else */
+ 		return;
+@@ -798,6 +803,10 @@
+ 		rn.err = -14;                   /* engine busy */
+ 		return;
+ 	}
++	if (rn.ifdis & 1u) {
++		rn.err = -15;                   /* FIFO interface off: GPI DMA only; send nothing */
++		return;
++	}
+ 
+ 	rn.stage = "pins";
+ 	for (unsigned p = 0; p < 4; p++) {
+@@ -886,13 +895,11 @@
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH A3: '%s' err=%d retry=%d xf=%u | CLK cmd=%#x cmd2=%#x cfg=%#x b144=%#x b138=%#x "
+-	    "vote=%#x | SE2 cmd=%#x cfg=%#x | FAIL op=%u n=%u irq=%#x st=%#x txfs=%#x ios=%#x | "
+-	    "id %02x %02x %02x %02x %02x %02x",
+-	    rn.stage ? rn.stage : "?", rn.err, rn.retry_err, rn.xfers,
+-	    rn.k_cmd, rn.k_cmd2, rn.rcgcfg, rn.k_b144, rn.k_b138, rn.vote,
+-	    rn.k_se2cmd, rn.k_se2cfg,
+-	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs, rn.f_ios,
++	panic("RAIN TOUCH A4: '%s' err=%d xf=%u | IF ifdis=%#x fw=%#x fws=%#x force=%#x st=%#x | "
++	    "FAIL op=%u n=%u irq=%#x st=%#x txfs=%#x | id %02x %02x %02x %02x %02x %02x",
++	    rn.stage ? rn.stage : "?", rn.err, rn.xfers,
++	    rn.ifdis, rn.fw, rn.fws, rn.seqcfg, rn.status,
++	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs,
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5]);
+ }
+ 
