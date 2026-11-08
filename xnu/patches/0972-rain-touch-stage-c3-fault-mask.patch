@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 04:25:00 +0100
+Subject: [PATCH] rain-0972: touch stage C3, count only real SMMU fault bits
+
+On the phone the first GPI transfer ran (ch0 RP = WP after 3 TREs, one
+event written, no global fault), but the probe stopped at once because
+the context bank FSR read 0x400: FSR.FORMAT (bits 10:9 = AArch64), not a
+fault. Only treat sGFSR bits 8:0 and MULTI, and CB FSR bits 8:1, SS and
+MULTI as faults.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -831,9 +831,10 @@
+ 	if (!sm.s || sm.seen) {
+ 		return sm.seen;
+ 	}
++	/* fault bits only: sGFSR 8:0 + MULTI; CB FSR 8:1 + SS + MULTI (bits 10:9 are FORMAT) */
+ 	uint32_t gfsr = touch_rd(sm.s, 0x48);
+ 	uint32_t cbfsr = sm.cb >= 0 ? touch_rd(sm.s, 0x40000u + 0x1000u * (uint32_t)sm.cb + 0x58u) : 0;
+-	if (!gfsr && !cbfsr) {
++	if (!(gfsr & 0x800001ffu) && !(cbfsr & 0xc00001feu)) {
+ 		return false;
+ 	}
+ 	sm.seen = true;
+@@ -1365,7 +1366,7 @@
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C2: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C3: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
