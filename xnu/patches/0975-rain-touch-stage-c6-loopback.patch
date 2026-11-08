@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 15:40:00 +0100
+Subject: [PATCH] rain-0975: touch stage C6, GPI RX loopback test
+
+Every GPI transfer completes on the phone, yet both chip-ID reads return
+zeros. Tell apart "RX DMA never wrote" from "MISO reads 0": fill the RX
+buffer with 0xa5 before each read, run one full-duplex transfer with the
+CONFIG0 loopback bit set before the Novatek sequence (expect the sent
+pattern back), and report the loopback bytes and the SE0 pin configs.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -743,9 +743,9 @@
+ 
+ /* SPI CONFIG0: 8-bit words (encoded bits-4), packing on, mode 0, clock source 0 (XO) / div. */
+ static void
+-rain_tre_config(struct rain_tre *t, uint32_t div)
++rain_tre_config(struct rain_tre *t, uint32_t div, bool loopback)
+ {
+-	t->w[0] = (8u - 4u) | (1u << 24) | (1u << 25);
++	t->w[0] = (8u - 4u) | (loopback ? (1u << 8) : 0u) | (1u << 24) | (1u << 25);
+ 	t->w[1] = 0;
+ 	t->w[2] = (div & 0xfffu) | (0u << 16);
+ 	t->w[3] = (RT_CONFIG0 << 16) | RT_CHAIN;
+@@ -781,6 +781,8 @@
+ 	uint32_t f_ch0, f_ch1, f_rp0, f_wp0, f_evrp, f_type, f_glob, f_gpii, f_err, f_srcch;
+ 	uint32_t ev_w2, ev_w3, nev;     /* last event seen */
+ 	const char *gstage;
++	bool loopback;                  /* 0975: CONFIG0 loopback for the RX path test */
++	uint8_t lb[8];
+ } rg;
+ 
+ static uint32_t rg_rd(uint32_t off) { return touch_rd(rg.g, off); }
+@@ -1040,10 +1042,10 @@
+ 	struct rain_tre *rxr = (struct rain_tre *)(rg.mem + RM_RX);
+ 	memcpy(txb, tx, n);
+ 	if (cmd == 3u) {
+-		memset((void *)(rg.mem + RM_RXBUF), 0, n);
++		memset((void *)(rg.mem + RM_RXBUF), 0xa5, n);  /* untouched bytes read back as a5 */
+ 		rain_tre_dma(&rxr[rg.rx_wp], rg.pa + RM_RXBUF, n, false);
+ 	}
+-	rain_tre_config(&txr[rg.tx_wp], 16);                       /* 19.2 MHz / 16 */
++	rain_tre_config(&txr[rg.tx_wp], 16, rg.loopback);          /* 19.2 MHz / 16 */
+ 	rain_tre_go(&txr[rg.tx_wp + 1u], cmd, cmd == 3u ? n : 0);
+ 	rain_tre_dma(&txr[rg.tx_wp + 2u], rg.pa + RM_TXBUF, n, true);
+ 	clean_dcache64((addr64_t)rg.pa, RM_EV, TRUE);              /* both TRE rings */
+@@ -1312,6 +1314,13 @@
+ 	rn.k_se2cmd = touch_rd(st.gcc, TOUCH_RCG);         /* topaz SE2, known good, read only */
+ 	rn.k_se2cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+ 
++	if (rg.mem) {
++		static const uint8_t pat[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
++		rn.stage = "loopback";
++		rg.loopback = true;
++		(void)rain_spi(RAIN_OP_FULL, pat, rg.lb, sizeof(pat));
++		rg.loopback = false;
++	}
+ 	rn.stage = "nvt eng reset";
+ 	int e = rain_nvt_write(RAIN_NVT_ENGRST, 0x5a);
+ 	if (e) {
+@@ -1380,9 +1389,9 @@
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C5: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C6: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+-	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x",
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+ 	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
+ 	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+@@ -1390,7 +1399,9 @@
+ 	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
+ 	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, (unsigned long long)rg.pa,
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5],
+-	    rn.id_old[0], rn.id_old[1], rn.id_old[2], rn.id_old[3], rn.id_old[4], rn.id_old[5]);
++	    rn.id_old[0], rn.id_old[1], rn.id_old[2], rn.id_old[3], rn.id_old[4], rn.id_old[5],
++	    rg.lb[0], rg.lb[1], rg.lb[2], rg.lb[3], rg.lb[4], rg.lb[5], rg.lb[6], rg.lb[7],
++	    rn.pin_after[0], rn.pin_after[1], rn.pin_after[2], rn.pin_after[3]);
+ }
+ 
+ static void
