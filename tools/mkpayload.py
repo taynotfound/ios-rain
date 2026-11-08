@@ -122,13 +122,13 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
-    """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
+def add_ramdisk_to_adt(adt_blob, phys, size, name='RAMDisk'):
+    """Return the ADT with /chosen/memory-map <name> = <phys, size> (two uintptr_t)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next(c for c in chosen.children if c.name == 'memory-map')
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(name) is None, f'ADT already has a {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
 
 
@@ -140,7 +140,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -167,6 +167,14 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    # extra blobs (firmware) after the kernel, found by the kernel in /chosen/memory-map
+    for name, path in blobs:
+        image = open(path, 'rb').read()
+        b_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        b_va = kernel_end
+        kernel_end = b_va + b_size
+        pieces.append((b_va, b_size, image))
+        adt_blob = add_ramdisk_to_adt(adt_blob, b_va - virt_base + PHYS_BASE, len(image), name)
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -198,8 +206,11 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--blob', action='append', default=[], metavar='NAME=PATH',
+                    help='extra file in RAM, at /chosen/memory-map NAME = <phys, length>')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blobs = [tuple(b.split('=', 1)) for b in a.blob]
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, blobs)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
