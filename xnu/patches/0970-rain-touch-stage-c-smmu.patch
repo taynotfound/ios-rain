@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 03:50:00 +0100
+Subject: [PATCH] rain-0970: touch stage C, SMMU identity bank for the GPI stream
+
+Bisecting with raintouchstop showed the whole GPI bring-up is safe and
+the SoC reset comes from the first doorbell, i.e. the first GPI fetch from
+RAM. The QUP0 GPI engine sits behind the apps SMMU (DT iommus = <&apps_smmu
+0xf6 0>). Before the first doorbell, give SID 0xf6 an identity context
+bank with topaz_smmu_identity() (TopazModem.cpp, the same helper the WLAN
+stream uses); if that fails the doorbell is never rung (err -41).
+Boot-arg raintouchpause=<ms> sets the breadcrumb pause (default 3000; 0
+lets the probe finish before iOS covers the console).
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -26,6 +26,7 @@
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);  /* TopazModem.cpp */
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
+@@ -782,13 +783,16 @@
+ 
+ static uint32_t rg_rd(uint32_t off) { return touch_rd(rg.g, off); }
+ /* 0967: on-screen breadcrumbs with a pause, and raintouchstop=N to stop after step N */
+-static unsigned rain_stop, rain_step;
++static unsigned rain_stop, rain_step, rain_pause_ms = 3000;
++static int rain_smmu = -1;      /* 0970: result of the SID 0xf6 identity bank */
+ static bool
+ rain_bc(unsigned n, const char *what)
+ {
+ 	rain_step = n;
+ 	printf("RAIN B: %u %s\n", n, what);
+-	touch_wait(3000);
++	if (rain_pause_ms) {
++		touch_wait(rain_pause_ms);
++	}
+ 	return rain_stop != 0 && n > rain_stop;   /* true: stop before doing step n */
+ }
+ static void rg_wr(uint32_t off, uint32_t v) { touch_wr(rg.g, off, v); }
+@@ -823,6 +827,7 @@
+ {
+ 	rg.gstage = "gpi map";
+ 	(void)PE_parse_boot_argn("raintouchstop", &rain_stop, sizeof(rain_stop));
++	(void)PE_parse_boot_argn("raintouchpause", &rain_pause_ms, sizeof(rain_pause_ms));
+ 	if (rain_bc(1, "map + alloc")) {
+ 		return -40;
+ 	}
+@@ -975,7 +980,17 @@
+ 	clean_dcache64((addr64_t)(rg.pa + RM_TXBUF), 0x100, TRUE);
+ 	flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	if (rn.xfers == 0 && rain_bc(12, "first doorbell (DMA)")) {
++	if (rn.xfers == 0 && rain_smmu < 0) {
++		if (rain_bc(12, "smmu identity sid f6")) {
++			return -40;
++		}
++		/* DT: qcom,gpi-dma@4a00000 iommus = <&apps_smmu 0xf6 0x0> */
++		rain_smmu = topaz_smmu_identity(0xf6u, 0u, "GPI0") ? 1 : 0;
++		if (!rain_smmu) {
++			return -41;          /* no identity bank: never ring the doorbell */
++		}
++	}
++	if (rn.xfers == 0 && rain_bc(13, "first doorbell (DMA)")) {
+ 		return -40;
+ 	}
+ 	if (cmd == 3u) {
+@@ -1279,10 +1294,10 @@
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH B4: step %u '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C: step %u '%s' err=%d xf=%u smmu=%d ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+-	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.ifdis,
++	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, rn.ifdis,
+ 	    rg.pre_ch0, rg.pre_ch1, rg.pre_ev, rg.st_ev, rg.st_ch0, rg.st_ch1, rg.st_go0, rg.st_go1,
+ 	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
+ 	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, (unsigned long long)rg.pa,
