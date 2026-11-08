@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 16:30:00 +0100
+Subject: [PATCH] rain-0977: touch stage C8, read GPI RX data uncached
+
+C7: the RX channel posts XFER_COMPLETE (chid 1) yet the buffer still holds
+the 0xa5 prefill. Read it through an uncached ml_io_map alias to tell a
+cache problem from a DMA that never writes; report the RX event's TRE
+pointer and length|code.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b659f33..bc6ccaa 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -781,6 +781,9 @@ static struct {
+ 	uint32_t f_ch0, f_ch1, f_rp0, f_wp0, f_evrp, f_type, f_glob, f_gpii, f_err, f_srcch;
+ 	uint32_t ev_w2, ev_w3, nev;     /* last event seen */
+ 	uint32_t rx_w3, nimm;           /* last RX-channel event; immediate-data events seen */
++	uint32_t rx_w0, rx_w2;          /* its TRE pointer (low) and length|code */
++	vm_offset_t uc;                 /* uncached alias of mem: DMA data without the CPU cache */
++	uint8_t cached[8];              /* last duplex RX as seen through the cached mapping */
+ 	const char *gstage;
+ 	bool loopback;                  /* 0975: CONFIG0 loopback for the RX path test */
+ 	uint8_t lb[8];
+@@ -918,6 +921,7 @@ rain_gpi_setup(void)
+ 	}
+ 	rg.pa = ((uint64_t)pn << PAGE_SHIFT) | (rg.mem & PAGE_MASK);
+ 	flush_dcache64((addr64_t)rg.pa, RM_SIZE, TRUE);
++	rg.uc = ml_io_map((vm_offset_t)rg.pa, RM_SIZE);
+ 
+ 	rg.pre_ch0 = rg_rd(RG_CH(0) + RC_CFG);
+ 	rg.pre_ch1 = rg_rd(RG_CH(1) + RC_CFG);
+@@ -1094,6 +1098,8 @@ rain_gpi_xfer(uint32_t cmd, const uint8_t *tx, uint8_t *rx, unsigned n)
+ 			}
+ 			if ((w3 >> 24) == 1u) {
+ 				rg.rx_w3 = w3;
++				rg.rx_w0 = ev[rg.ev_rp].w[0];
++				rg.rx_w2 = ev[rg.ev_rp].w[2];
+ 				rx_done = true;
+ 				/* IMMEDIATE_DATA (0x30): up to 8 RX bytes ride in the event, length in w2[3:0] */
+ 				if (((w3 >> 16) & 0xffu) == 0x30u) {
+@@ -1118,7 +1124,14 @@ rain_gpi_xfer(uint32_t cmd, const uint8_t *tx, uint8_t *rx, unsigned n)
+ 	}
+ 	if (cmd == 3u) {
+ 		flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
+-		memcpy(rx, (const void *)(rg.mem + RM_RXBUF), n);
++		memcpy(rg.cached, (const void *)(rg.mem + RM_RXBUF), 8);
++		if (rg.uc) {
++			for (unsigned i = 0; i < n; i++) {   /* byte reads: device memory, no memcpy */
++				rx[i] = ((volatile uint8_t *)(rg.uc + RM_RXBUF))[i];
++			}
++		} else {
++			memcpy(rx, (const void *)(rg.mem + RM_RXBUF), n);
++		}
+ 	}
+ 	rn.xfers++;
+ 	return 0;
+@@ -1398,15 +1411,16 @@ rain_touch_report(void)
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C7: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C8: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+-	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x imm=%u pa=%#llx | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x",
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+ 	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
+ 	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+ 	    rg.pre_ch0, rg.pre_ch1, rg.pre_ev, rg.st_ev, rg.st_ch0, rg.st_ch1, rg.st_go0, rg.st_go1,
+ 	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
+-	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, rg.rx_w3, rg.nimm, (unsigned long long)rg.pa,
++	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, rg.rx_w3, rg.rx_w0, rg.rx_w2, rg.nimm, rg.uc != 0, (unsigned long long)rg.pa,
++	    rg.cached[0], rg.cached[1], rg.cached[2], rg.cached[3],
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5],
+ 	    rn.id_old[0], rn.id_old[1], rn.id_old[2], rn.id_old[3], rn.id_old[4], rn.id_old[5],
+ 	    rg.lb[0], rg.lb[1], rg.lb[2], rg.lb[3], rg.lb[4], rg.lb[5], rg.lb[6], rg.lb[7],
