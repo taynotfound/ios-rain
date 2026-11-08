@@ -8,3 +8,14 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# rain (Redmi 10C) build outputs: large, and payloads may carry vendor firmware
+build-rain/payload*.bin
+build-rain/*.img
+build-rain/*.log
+build-rain/work/**/t
+build-rain/work/**/test
+build-rain/work/**/*.o
+build-rain/work/*/check/
+build-rain/work/tree/
+build-rain/work/test/test9*

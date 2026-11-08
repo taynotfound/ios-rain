@@ -1,0 +1,4 @@
+#!/bin/sh
+# shortcut: clang stands in for the GNU cross gcc; drops the one GNU-ld-only flag lld rejects
+args=""; for a in "$@"; do [ "$a" = "-Wl,--no-warn-rwx-segments" ] || args="$args '$a'"; done
+eval exec clang --target=aarch64-linux-gnu -fuse-ld=lld -fno-jump-tables -Wno-unused-command-line-argument $args
