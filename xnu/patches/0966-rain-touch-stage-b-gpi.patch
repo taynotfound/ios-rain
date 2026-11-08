@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 02:30:00 +0100
+Subject: [PATCH] rain-0966: touch stage B, SPI over GPI DMA (QUP0 GPII 0)
+
+SE0 on rain has FIFO_IF_DISABLE set, so SPI needs the QUP0 GPI engine.
+With raintouch=1 and the FIFO interface off, the probe now puts SE0 in
+GPI mode, allocates a 16 KiB contiguous block (TX/RX rings of 64 TREs,
+an event ring of 128, TX/RX buffers), allocates and starts the event
+ring and channels 0 (TX) / 1 (RX) of GPII 0 for SPI on SE 0, polling the
+context state for each command, and sends every SPI command as CONFIG0 +
+GO + DMA TREs (plus an RX DMA TRE for full duplex), waiting for transfer
+complete events. Stops without touching GPII 0 if it is already owned.
+The panic report carries channel/event states, ring pointers, IRQ status
+and the GPII error log.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -16,12 +16,16 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
+@@ -677,11 +681,312 @@
+ 	rn.f_sirq = touch_rd(rn.se, 0x640);        /* S engine IRQ status */
+ }
+ 
++/*
++ * rain 0966: GPI (QUP GSI) DMA for SE0. On rain SE0 has FIFO_IF_DISABLE
++ * set, so SPI only works through GPI instance 0 of the QUP0 GPI engine
++ * (DT qcom,gpi-dma@4a00000, ee offset 0x10000, SE0 dmas: GPII 0, ch 0 TX /
++ * ch 1 RX, protocol 1). Polled: no interrupts are used.
++ * GPII 0 register block = 0x4a00000 - 0x10000 + 0x20000.
++ */
++#define RG_PA          0x04a10000u
++#define RG_CH(k)       (0x0000u + 0x80u * (k))   /* channel context */
++#define RG_EV          0x1000u                   /* event ring context */
++#define RG_CH_DB(k)    (0x2000u + 0x8u * (k))
++#define RG_EV_DB       0x2100u
++#define RG_CH_CMD      0x3008u
++#define RG_EV_CMD      0x3010u
++#define RG_TYPE_IRQ    0x3080u
++#define RG_SRC_CH      0x3090u
++#define RG_SRC_EV      0x3094u
++#define RG_SRC_CH_CLR  0x30a0u
++#define RG_SRC_EV_CLR  0x30a4u
++#define RG_IEOB_CLR    0x30c0u
++#define RG_GLOB_STTS   0x3100u
++#define RG_GPII_STTS   0x3118u
++#define RG_INTSET      0x3180u
++#define RG_ERRLOG      0x3200u
++#define RG_QOS(k)      (0x005cu + 0x80u * (k))
++#define RG_SCR(k, i)   (0x0060u + 0x80u * (k) + 4u * (i))
++/* context words */
++#define RC_CFG         0x00u
++#define RC_LEN         0x04u
++#define RC_BASE_LO     0x08u
++#define RC_BASE_HI     0x0cu
++#define RC_RP_LO       0x10u
++#define RC_WP_LO       0x18u
++#define RC_INTMOD      0x20u
++#define RC_MSI_LO      0x28u
++#define RC_MSI_HI      0x2cu
++#define RC_RPU_LO      0x30u
++#define RC_RPU_HI      0x34u
++#define RG_STATE(v)    (((v) >> 20) & 0xfu)      /* 1 allocated, 2 started */
++/* ring entries (16 bytes) */
++#define RT_DMA         0x10u
++#define RT_GO          0x20u
++#define RT_CONFIG0     0x22u
++#define RT_CHAIN       (1u << 0)
++#define RT_IEOT        (1u << 9)
++#define RG_NTRE        64u
++#define RG_NEV         128u
++/* memory layout in one 16 KiB contiguous block */
++#define RM_TX          0x0000u
++#define RM_RX          0x0400u
++#define RM_EV          0x0800u
++#define RM_TXBUF       0x1000u
++#define RM_RXBUF       0x1100u
++#define RM_SIZE        0x4000u
++
++struct rain_tre { uint32_t w[4]; };
++
++/* SPI CONFIG0: 8-bit words (encoded bits-4), packing on, mode 0, clock source 0 (XO) / div. */
++static void
++rain_tre_config(struct rain_tre *t, uint32_t div)
++{
++	t->w[0] = (8u - 4u) | (1u << 24) | (1u << 25);
++	t->w[1] = 0;
++	t->w[2] = (div & 0xfffu) | (0u << 16);
++	t->w[3] = (RT_CONFIG0 << 16) | RT_CHAIN;
++}
++
++/* GO: SPI command (1 TX, 3 duplex), chip select 0, no fragmentation (CS drops after). */
++static void
++rain_tre_go(struct rain_tre *t, uint32_t cmd, uint32_t rx_len)
++{
++	t->w[0] = cmd & 0x1fu;
++	t->w[1] = 0;
++	t->w[2] = rx_len & 0xffffffu;
++	t->w[3] = (RT_GO << 16) | RT_CHAIN;
++}
++
++static void
++rain_tre_dma(struct rain_tre *t, uint64_t pa, uint32_t len)
++{
++	t->w[0] = (uint32_t)pa;
++	t->w[1] = (uint32_t)(pa >> 32);
++	t->w[2] = len & 0xffffffu;
++	t->w[3] = (RT_DMA << 16) | RT_IEOT;
++}
++
++static struct {
++	vm_offset_t g;                  /* GPII 0 registers */
++	vm_offset_t mem;                /* contiguous block, kernel VA */
++	uint64_t pa;                    /* its physical address */
++	unsigned tx_wp, rx_wp, ev_rp;   /* in elements */
++	uint32_t pre_ch0, pre_ch1, pre_ev, st_ev, st_ch0, st_ch1, st_go0, st_go1;
++	/* first failed transfer */
++	bool snapped;
++	uint32_t f_ch0, f_ch1, f_rp0, f_wp0, f_evrp, f_type, f_glob, f_gpii, f_err, f_srcch;
++	uint32_t ev_w2, ev_w3, nev;     /* last event seen */
++	const char *gstage;
++} rg;
++
++static uint32_t rg_rd(uint32_t off) { return touch_rd(rg.g, off); }
++static void rg_wr(uint32_t off, uint32_t v) { touch_wr(rg.g, off, v); }
++
++/* Poll a context's state field after a command; clear the per-channel/event IRQ status. */
++static bool
++rain_gpi_wait(uint32_t ctx, uint32_t want)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		if (RG_STATE(rg_rd(ctx + RC_CFG)) == want) {
++			rg_wr(RG_SRC_CH_CLR, rg_rd(RG_SRC_CH));
++			rg_wr(RG_SRC_EV_CLR, rg_rd(RG_SRC_EV));
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++rain_gpi_ring_ctx(uint32_t ctx, uint32_t cfg, uint32_t off, uint32_t len, uint32_t db)
++{
++	rg_wr(ctx + RC_CFG, cfg);
++	rg_wr(ctx + RC_LEN, len);
++	rg_wr(ctx + RC_BASE_LO, (uint32_t)(rg.pa + off));
++	rg_wr(ctx + RC_BASE_HI, (uint32_t)((rg.pa + off) >> 32));
++	rg_wr(db + 4u, (uint32_t)((rg.pa + off) >> 32));      /* doorbell high word */
++}
++
++static int
++rain_gpi_setup(void)
++{
++	rg.gstage = "gpi map";
++	rg.g = ml_io_map(RG_PA, 0x4000);
++	if (!rg.g) {
++		return -20;
++	}
++	if (kmem_alloc_contig(kernel_map, &rg.mem, RM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return -21;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)rg.mem);
++	if (!pn) {
++		return -22;
++	}
++	rg.pa = ((uint64_t)pn << PAGE_SHIFT) | (rg.mem & PAGE_MASK);
++	flush_dcache64((addr64_t)rg.pa, RM_SIZE, TRUE);
++
++	rg.pre_ch0 = rg_rd(RG_CH(0) + RC_CFG);
++	rg.pre_ch1 = rg_rd(RG_CH(1) + RC_CFG);
++	rg.pre_ev = rg_rd(RG_EV + RC_CFG);
++	if (RG_STATE(rg.pre_ch0) || RG_STATE(rg.pre_ch1) || RG_STATE(rg.pre_ev)) {
++		return -23;                     /* someone else owns GPII 0: touch nothing */
++	}
++
++	/* SE0 into GPI mode (qcom-geni-se: select_gpi_mode) */
++	touch_wr(rn.se, 0xe1c, 0);
++	touch_wr(rn.se, SE_IRQ_EN, 0);
++	touch_wr(rn.se, SE_DMA, 1);
++	touch_wr(rn.se, 0xe18, touch_rd(rn.se, 0xe18) | 0xfu);
++
++	rg_wr(RG_INTSET, 1);
++
++	rg.gstage = "ev alloc";
++	rg_wr(RG_EV_CMD, (0u << 24) | 0u);
++	if (!rain_gpi_wait(RG_EV, 1)) {
++		rg.st_ev = rg_rd(RG_EV + RC_CFG);
++		return -24;
++	}
++	rg.st_ev = rg_rd(RG_EV + RC_CFG);
++	rain_gpi_ring_ctx(RG_EV, (16u << 24) | (1u << 16) | 2u, RM_EV, RG_NEV * 16u, RG_EV_DB);
++	rg_wr(RG_EV + RC_INTMOD, 0);
++	rg_wr(RG_EV + RC_MSI_LO, 0);
++	rg_wr(RG_EV + RC_MSI_HI, 0);
++	rg_wr(RG_EV + RC_RPU_LO, 0);
++	rg_wr(RG_EV + RC_RPU_HI, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	rg_wr(RG_EV_DB, (uint32_t)(rg.pa + RM_EV + (RG_NEV - 1u) * 16u));  /* whole ring to GSI */
++
++	for (uint32_t k = 0; k < 2; k++) {
++		rg.gstage = k ? "ch1 alloc" : "ch0 alloc";
++		rg_wr(RG_CH_CMD, (0u << 24) | k);
++		bool alloc_ok = rain_gpi_wait(RG_CH(k), 1);
++		if (k) {
++			rg.st_ch1 = rg_rd(RG_CH(k) + RC_CFG);
++		} else {
++			rg.st_ch0 = rg_rd(RG_CH(k) + RC_CFG);
++		}
++		if (!alloc_ok) {
++			return -25 - (int)k;
++		}
++		/* el size 16, event ring 0, dir (ch0 out = 1, ch1 in = 0), protocol GPI */
++		rain_gpi_ring_ctx(RG_CH(k), (16u << 24) | (0u << 14) | ((k ? 0u : 1u) << 3) | 2u,
++		    k ? RM_RX : RM_TX, RG_NTRE * 16u, RG_CH_DB(k));
++		rg_wr(RG_SCR(k, 0), ((k ^ 1u) << 16) | (1u << 4) | 0u);  /* pair, SPI, SE 0 */
++		rg_wr(RG_SCR(k, 1), 0);
++		rg_wr(RG_SCR(k, 2), 0);
++		rg_wr(RG_SCR(k, 3), 0);
++		rg_wr(RG_QOS(k), 1);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (uint32_t k = 0; k < 2; k++) {
++		rg.gstage = k ? "ch1 start" : "ch0 start";
++		rg_wr(RG_CH_CMD, (1u << 24) | k);
++		bool ok = rain_gpi_wait(RG_CH(k), 2);
++		if (k) {
++			rg.st_go1 = rg_rd(RG_CH(k) + RC_CFG);
++		} else {
++			rg.st_go0 = rg_rd(RG_CH(k) + RC_CFG);
++		}
++		if (!ok) {
++			return -27 - (int)k;
++		}
++	}
++	rg.gstage = "gpi ready";
++	return 0;
++}
++
++static void
++rain_gpi_snap(void)
++{
++	if (rg.snapped) {
++		return;
++	}
++	rg.snapped = true;
++	rg.f_ch0 = rg_rd(RG_CH(0) + RC_CFG);
++	rg.f_ch1 = rg_rd(RG_CH(1) + RC_CFG);
++	rg.f_rp0 = rg_rd(RG_CH(0) + RC_RP_LO);
++	rg.f_wp0 = rg_rd(RG_CH(0) + RC_WP_LO);
++	rg.f_evrp = rg_rd(RG_EV + RC_RP_LO);
++	rg.f_type = rg_rd(RG_TYPE_IRQ);
++	rg.f_glob = rg_rd(RG_GLOB_STTS);
++	rg.f_gpii = rg_rd(RG_GPII_STTS);
++	rg.f_err = rg_rd(RG_ERRLOG);
++	rg.f_srcch = rg_rd(RG_SRC_CH);
++}
++
++/* One SPI command over GPI. cmd 1 = TX only, 3 = full duplex (rx gets n bytes). */
++static int
++rain_gpi_xfer(uint32_t cmd, const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	if (n == 0 || n > 0x100u || rg.tx_wp + 3u > RG_NTRE || rg.rx_wp + 1u > RG_NTRE) {
++		return -30;                     /* probe never wraps the rings */
++	}
++	uint8_t *txb = (uint8_t *)(rg.mem + RM_TXBUF);
++	struct rain_tre *txr = (struct rain_tre *)(rg.mem + RM_TX);
++	struct rain_tre *rxr = (struct rain_tre *)(rg.mem + RM_RX);
++	memcpy(txb, tx, n);
++	if (cmd == 3u) {
++		memset((void *)(rg.mem + RM_RXBUF), 0, n);
++		rain_tre_dma(&rxr[rg.rx_wp], rg.pa + RM_RXBUF, n);
++	}
++	rain_tre_config(&txr[rg.tx_wp], 16);                       /* 19.2 MHz / 16 */
++	rain_tre_go(&txr[rg.tx_wp + 1u], cmd, cmd == 3u ? n : 0);
++	rain_tre_dma(&txr[rg.tx_wp + 2u], rg.pa + RM_TXBUF, n);
++	clean_dcache64((addr64_t)rg.pa, RM_EV, TRUE);              /* both TRE rings */
++	clean_dcache64((addr64_t)(rg.pa + RM_TXBUF), 0x100, TRUE);
++	flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (cmd == 3u) {
++		rg.rx_wp += 1u;
++		rg_wr(RG_CH_DB(1), (uint32_t)(rg.pa + RM_RX + rg.rx_wp * 16u));
++	}
++	rg.tx_wp += 3u;
++	rg_wr(RG_CH_DB(0), (uint32_t)(rg.pa + RM_TX + rg.tx_wp * 16u));
++
++	/* wait for a transfer-complete event (type 0x22) for every channel used */
++	unsigned need = cmd == 3u ? 2u : 1u, got = 0;
++	struct rain_tre *ev = (struct rain_tre *)(rg.mem + RM_EV);
++	for (unsigned spin = 0; spin < 200000 && got < need; spin++) {
++		flush_dcache64((addr64_t)(rg.pa + RM_EV), RG_NEV * 16u, TRUE);
++		while (rg.ev_rp < RG_NEV && ev[rg.ev_rp].w[3] != 0) {
++			uint32_t w3 = ev[rg.ev_rp].w[3];
++			rg.ev_w2 = ev[rg.ev_rp].w[2];
++			rg.ev_w3 = w3;
++			rg.nev++;
++			if (((w3 >> 16) & 0xffu) == 0x22u) {
++				got++;
++			}
++			rg.ev_rp++;
++		}
++		if (got < need) {
++			delay(1);
++		}
++	}
++	/* hand the consumed events back; clear end-of-block status */
++	rg_wr(RG_EV_DB, (uint32_t)(rg.pa + RM_EV + ((rg.ev_rp + RG_NEV - 1u) % RG_NEV) * 16u));
++	rg_wr(RG_IEOB_CLR, 0xffffffffu);
++	if (got < need) {
++		rain_gpi_snap();
++		return -31;
++	}
++	if (cmd == 3u) {
++		flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
++		memcpy(rx, (const void *)(rg.mem + RM_RXBUF), n);
++	}
++	rn.xfers++;
++	return 0;
++}
++
+ /* One SPI command of n (<= 32) bytes, chip select held for the whole command. */
+ static int
+ rain_spi(uint32_t op, const uint8_t *tx, uint8_t *rx, unsigned n)
+ {
+ 	vm_offset_t se = rn.se;
++	if (rg.mem) {
++		return rain_gpi_xfer(op == RAIN_OP_FULL ? 3u : 1u, tx, rx, n);
++	}
+ 	if (n == 0 || n > 32) {
+ 		return -1;
+ 	}
+@@ -804,8 +1109,13 @@
+ 		return;
+ 	}
+ 	if (rn.ifdis & 1u) {
+-		rn.err = -15;                   /* FIFO interface off: GPI DMA only; send nothing */
+-		return;
++		/* FIFO interface off: GPI DMA only */
++		int ge = rain_gpi_setup();
++		if (ge) {
++			rn.err = ge;
++			rn.stage = rg.gstage;
++			return;
++		}
+ 	}
+ 
+ 	rn.stage = "pins";
+@@ -819,6 +1129,7 @@
+ 	}
+ 
+ 	rn.stage = "se0 spi init";
++	if (!rg.mem) {
+ 	touch_wr(rn.se, 0xe18, 0);          /* no GSI */
+ 	touch_wr(rn.se, 0xe1c, 0);
+ 	touch_wr(rn.se, 0x644, 0);
+@@ -849,6 +1160,7 @@
+ 	touch_wr(rn.se, 0x810, 0);
+ 	touch_wr(rn.se, 0x814, ((rn.hwrx >> 16) & 0x3fu) - 1u);
+ 	touch_wr(rn.se, SE_IRQ_EN, SE_EVENTS);
++	}
+ 	rn.c_mclk = touch_rd(rn.se, SE_MCLK);
+ 	rn.c_clksel = touch_rd(rn.se, SE_CLK_SEL);
+ 	rn.c_word = touch_rd(rn.se, RAIN_SPI_WORDLEN);
+@@ -895,11 +1207,13 @@
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH A4: '%s' err=%d xf=%u | IF ifdis=%#x fw=%#x fws=%#x force=%#x st=%#x | "
+-	    "FAIL op=%u n=%u irq=%#x st=%#x txfs=%#x | id %02x %02x %02x %02x %02x %02x",
+-	    rn.stage ? rn.stage : "?", rn.err, rn.xfers,
+-	    rn.ifdis, rn.fw, rn.fws, rn.seqcfg, rn.status,
+-	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs,
++	panic("RAIN TOUCH B: '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
++	    rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.ifdis,
++	    rg.pre_ch0, rg.pre_ch1, rg.pre_ev, rg.st_ev, rg.st_ch0, rg.st_ch1, rg.st_go0, rg.st_go1,
++	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
++	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, (unsigned long long)rg.pa,
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5]);
+ }
+ 
