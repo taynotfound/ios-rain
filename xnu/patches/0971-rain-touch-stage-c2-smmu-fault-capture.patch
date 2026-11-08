@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 04:10:00 +0100
+Subject: [PATCH] rain-0971: touch stage C2, capture apps SMMU faults at the first doorbell
+
+With the SID 0xf6 identity bank in place (verified on the phone) the first
+GPI doorbell still resets the SoC. sCR0 = 0x002e0406: unmatched streams
+fault (USFCFG) and global faults are reported by interrupt (GFRE/GFIE).
+Before the first doorbell clear GFRE/GFIE (boot-arg raintouchgfault=1
+keeps them) and the sGFSR / CB FSR status, then poll the global and the
+context-bank fault registers while waiting for the transfer event; on a
+fault stop with err -32 and report sGFSR, sGFSYNR0..2 (SYNR1 = SID),
+sGFAR and the CB FSR/FAR/FSYNR0.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -785,6 +785,73 @@
+ /* 0967: on-screen breadcrumbs with a pause, and raintouchstop=N to stop after step N */
+ static unsigned rain_stop, rain_step, rain_pause_ms = 3000;
+ static int rain_smmu = -1;      /* 0970: result of the SID 0xf6 identity bank */
++/*
++ * 0971: apps SMMU (MMU-500 at 0xc600000, 4 KiB pages, 64 global pages) fault capture
++ * around the first doorbell. sCR0 GFRE|GFIE are cleared first so a global fault is
++ * recorded instead of raised; the probe then reports the faulting SID and address.
++ */
++static struct {
++	vm_offset_t s;
++	int cb;
++	uint32_t cr0_was, cr0_now, gfsr, gfsynr0, gfsynr1, gfsynr2, gfar_lo, gfar_hi, cbfsr, cbfar_lo, cbfar_hi, cbfsynr0;
++	bool seen;
++} sm;
++
++static void
++rain_smmu_arm(void)
++{
++	sm.cb = -1;
++	sm.s = ml_io_map(0x0c600000u, 0x80000);
++	if (!sm.s) {
++		return;
++	}
++	for (uint32_t i = 0; i < 128; i++) {      /* the slot topaz_smmu_identity filled */
++		if (touch_rd(sm.s, 0x800u + 4u * i) == 0x800000f6u) {
++			sm.cb = (int)(touch_rd(sm.s, 0xc00u + 4u * i) & 0x3fu);
++			break;
++		}
++	}
++	sm.cr0_was = touch_rd(sm.s, 0x0);
++	uint32_t raise = 0;
++	(void)PE_parse_boot_argn("raintouchgfault", &raise, sizeof(raise));
++	if (!raise) {
++		touch_wr(sm.s, 0x0, sm.cr0_was & ~0x6u);    /* GFRE, GFIE off */
++	}
++	sm.cr0_now = touch_rd(sm.s, 0x0);
++	touch_wr(sm.s, 0x48, 0xffffffffu);          /* sGFSR: clear */
++	if (sm.cb >= 0) {
++		touch_wr(sm.s, 0x40000u + 0x1000u * (uint32_t)sm.cb + 0x58u, 0xffffffffu);   /* CB FSR */
++	}
++}
++
++/* true once the SMMU has recorded any fault */
++static bool
++rain_smmu_check(void)
++{
++	if (!sm.s || sm.seen) {
++		return sm.seen;
++	}
++	uint32_t gfsr = touch_rd(sm.s, 0x48);
++	uint32_t cbfsr = sm.cb >= 0 ? touch_rd(sm.s, 0x40000u + 0x1000u * (uint32_t)sm.cb + 0x58u) : 0;
++	if (!gfsr && !cbfsr) {
++		return false;
++	}
++	sm.seen = true;
++	sm.gfsr = gfsr;
++	sm.gfsynr0 = touch_rd(sm.s, 0x50);
++	sm.gfsynr1 = touch_rd(sm.s, 0x54);  /* bits 15:0 = faulting SID */
++	sm.gfsynr2 = touch_rd(sm.s, 0x58);
++	sm.gfar_lo = touch_rd(sm.s, 0x40);
++	sm.gfar_hi = touch_rd(sm.s, 0x44);
++	sm.cbfsr = cbfsr;
++	if (sm.cb >= 0) {
++		vm_offset_t cbp = 0x40000u + 0x1000u * (uint32_t)sm.cb;
++		sm.cbfar_lo = touch_rd(sm.s, cbp + 0x60u);
++		sm.cbfar_hi = touch_rd(sm.s, cbp + 0x64u);
++		sm.cbfsynr0 = touch_rd(sm.s, cbp + 0x68u);
++	}
++	return true;
++}
+ static bool
+ rain_bc(unsigned n, const char *what)
+ {
+@@ -989,6 +1056,7 @@
+ 		if (!rain_smmu) {
+ 			return -41;          /* no identity bank: never ring the doorbell */
+ 		}
++		rain_smmu_arm();
+ 	}
+ 	if (rn.xfers == 0 && rain_bc(13, "first doorbell (DMA)")) {
+ 		return -40;
+@@ -1004,6 +1072,9 @@
+ 	unsigned need = cmd == 3u ? 2u : 1u, got = 0;
+ 	struct rain_tre *ev = (struct rain_tre *)(rg.mem + RM_EV);
+ 	for (unsigned spin = 0; spin < 200000 && got < need; spin++) {
++		if (rain_smmu_check()) {
++			break;
++		}
+ 		flush_dcache64((addr64_t)(rg.pa + RM_EV), RG_NEV * 16u, TRUE);
+ 		while (rg.ev_rp < RG_NEV && ev[rg.ev_rp].w[3] != 0) {
+ 			uint32_t w3 = ev[rg.ev_rp].w[3];
+@@ -1024,7 +1095,7 @@
+ 	rg_wr(RG_IEOB_CLR, 0xffffffffu);
+ 	if (got < need) {
+ 		rain_gpi_snap();
+-		return -31;
++		return sm.seen ? -32 : -31;     /* -32: the SMMU recorded a fault */
+ 	}
+ 	if (cmd == 3u) {
+ 		flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
+@@ -1294,10 +1365,12 @@
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C: step %u '%s' err=%d xf=%u smmu=%d ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C2: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+-	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, rn.ifdis,
++	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
++	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
++	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+ 	    rg.pre_ch0, rg.pre_ch1, rg.pre_ev, rg.st_ev, rg.st_ch0, rg.st_ch1, rg.st_go0, rg.st_go1,
+ 	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
+ 	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, (unsigned long long)rg.pa,
