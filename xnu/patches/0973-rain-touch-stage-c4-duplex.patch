@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 15:00:00 +0100
+Subject: [PATCH] rain-0973: touch stage C4, full-duplex SPI over GPI
+
+On the phone five TX-only GPI transfers completed (no faults, no reset),
+but the first full-duplex read stalled at its TX DMA TRE. As in Linux
+gpi.c, a duplex GO TRE carries CHAIN|LINK and only the TX DMA TRE gets
+IEOT. A transfer is done on the TX transfer-complete event (chid 0); a
+duplex one also waits for the RX ring read pointer to reach its write
+pointer before the data is copied out.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -727,6 +727,7 @@
+ #define RT_CONFIG0     0x22u
+ #define RT_CHAIN       (1u << 0)
+ #define RT_IEOT        (1u << 9)
++#define RT_LINK        (1u << 11)      /* duplex GO: tie in the RX channel */
+ #define RG_NTRE        64u
+ #define RG_NEV         128u
+ /* memory layout in one 16 KiB contiguous block */
+@@ -756,16 +757,16 @@
+ 	t->w[0] = cmd & 0x1fu;
+ 	t->w[1] = 0;
+ 	t->w[2] = rx_len & 0xffffffu;
+-	t->w[3] = (RT_GO << 16) | RT_CHAIN;
++	t->w[3] = (RT_GO << 16) | RT_CHAIN | (cmd == 3u ? RT_LINK : 0u);
+ }
+ 
+ static void
+-rain_tre_dma(struct rain_tre *t, uint64_t pa, uint32_t len)
++rain_tre_dma(struct rain_tre *t, uint64_t pa, uint32_t len, bool ieot)
+ {
+ 	t->w[0] = (uint32_t)pa;
+ 	t->w[1] = (uint32_t)(pa >> 32);
+ 	t->w[2] = len & 0xffffffu;
+-	t->w[3] = (RT_DMA << 16) | RT_IEOT;
++	t->w[3] = (RT_DMA << 16) | (ieot ? RT_IEOT : 0u);   /* only the TX side signals end of transfer */
+ }
+ 
+ static struct {
+@@ -1039,11 +1040,11 @@
+ 	memcpy(txb, tx, n);
+ 	if (cmd == 3u) {
+ 		memset((void *)(rg.mem + RM_RXBUF), 0, n);
+-		rain_tre_dma(&rxr[rg.rx_wp], rg.pa + RM_RXBUF, n);
++		rain_tre_dma(&rxr[rg.rx_wp], rg.pa + RM_RXBUF, n, false);
+ 	}
+ 	rain_tre_config(&txr[rg.tx_wp], 16);                       /* 19.2 MHz / 16 */
+ 	rain_tre_go(&txr[rg.tx_wp + 1u], cmd, cmd == 3u ? n : 0);
+-	rain_tre_dma(&txr[rg.tx_wp + 2u], rg.pa + RM_TXBUF, n);
++	rain_tre_dma(&txr[rg.tx_wp + 2u], rg.pa + RM_TXBUF, n, true);
+ 	clean_dcache64((addr64_t)rg.pa, RM_EV, TRUE);              /* both TRE rings */
+ 	clean_dcache64((addr64_t)(rg.pa + RM_TXBUF), 0x100, TRUE);
+ 	flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
+@@ -1069,10 +1070,12 @@
+ 	rg.tx_wp += 3u;
+ 	rg_wr(RG_CH_DB(0), (uint32_t)(rg.pa + RM_TX + rg.tx_wp * 16u));
+ 
+-	/* wait for a transfer-complete event (type 0x22) for every channel used */
+-	unsigned need = cmd == 3u ? 2u : 1u, got = 0;
++	/* done = TX transfer-complete event (type 0x22, chid 0); duplex also needs the RX ring drained */
++	unsigned need = 1u, got = 0;
++	uint32_t rx_end = (uint32_t)(rg.pa + RM_RX + rg.rx_wp * 16u);
++	bool rx_done = cmd != 3u;
+ 	struct rain_tre *ev = (struct rain_tre *)(rg.mem + RM_EV);
+-	for (unsigned spin = 0; spin < 200000 && got < need; spin++) {
++	for (unsigned spin = 0; spin < 200000 && (got < need || !rx_done); spin++) {
+ 		if (rain_smmu_check()) {
+ 			break;
+ 		}
+@@ -1082,19 +1085,22 @@
+ 			rg.ev_w2 = ev[rg.ev_rp].w[2];
+ 			rg.ev_w3 = w3;
+ 			rg.nev++;
+-			if (((w3 >> 16) & 0xffu) == 0x22u) {
++			if (((w3 >> 16) & 0xffu) == 0x22u && (w3 >> 24) == 0u) {
+ 				got++;
+ 			}
+ 			rg.ev_rp++;
+ 		}
+-		if (got < need) {
++		if (!rx_done) {
++			rx_done = rg_rd(RG_CH(1) + RC_RP_LO) == rx_end;
++		}
++		if (got < need || !rx_done) {
+ 			delay(1);
+ 		}
+ 	}
+ 	/* hand the consumed events back; clear end-of-block status */
+ 	rg_wr(RG_EV_DB, (uint32_t)(rg.pa + RM_EV + ((rg.ev_rp + RG_NEV - 1u) % RG_NEV) * 16u));
+ 	rg_wr(RG_IEOB_CLR, 0xffffffffu);
+-	if (got < need) {
++	if (got < need || !rx_done) {
+ 		rain_gpi_snap();
+ 		return sm.seen ? -32 : -31;     /* -32: the SMMU recorded a fault */
+ 	}
+@@ -1366,7 +1372,7 @@
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C3: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C4: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
