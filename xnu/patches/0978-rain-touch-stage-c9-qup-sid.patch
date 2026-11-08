@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 16:45:00 +0100
+Subject: [PATCH] rain-0978: touch stage C9, QUP0 stream 0xe3 identity
+
+C8: uncached RX buffer still 0xa5 while the RX event reports 8 bytes (EOT),
+and GPI's own event writes land. Record the loader's SMR for the QUP0
+wrapper SID 0xe3, give it an identity bank too, and scan every context
+bank for a fault.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index bc6ccaa..34738f9 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -805,6 +805,58 @@ static struct {
+ 	bool seen;
+ } sm;
+ 
++/* C9: the QUP0 wrapper's own stream (DT qupv3_id_0 iommus = <&apps_smmu 0xe3 0x0>) and any CB fault */
++static struct {
++	uint32_t nvalid, slot, smr, s2cr, sctlr;    /* bootloader's SMR state for SID 0xe3 */
++	bool e3;                                    /* identity bank installed for 0xe3 */
++	int fcb;                                    /* first context bank with a fault, -1 none */
++	uint32_t ffsr, ffar, fsyn, fsid;
++} r9 = { .slot = 0xffu, .fcb = -1 };
++
++static void
++rain_smmu_pre(void)
++{
++	vm_offset_t s = ml_io_map(0x0c600000u, 0x80000);
++	if (!s) {
++		return;
++	}
++	for (uint32_t i = 0; i < 50; i++) {
++		uint32_t smr = touch_rd(s, 0x800u + 4u * i);
++		if (!(smr >> 31)) {
++			continue;
++		}
++		r9.nvalid++;
++		uint32_t id = smr & 0x7fffu, m = (smr >> 16) & 0x7fffu;
++		if (((id ^ 0xe3u) & ~m & 0x7fffu) == 0 && r9.slot == 0xffu) {
++			r9.slot = i;
++			r9.smr = smr;
++			r9.s2cr = touch_rd(s, 0xc00u + 4u * i);
++			if (((r9.s2cr >> 16) & 3u) == 0) {      /* translate: that bank's SCTLR */
++				r9.sctlr = touch_rd(s, 0x40000u + 0x1000u * (r9.s2cr & 0x3fu));
++			}
++		}
++	}
++}
++
++static void
++rain_smmu_cbscan(void)
++{
++	if (!sm.s) {
++		return;
++	}
++	for (uint32_t cb = 0; cb < 48; cb++) {
++		uint32_t fsr = touch_rd(sm.s, 0x40000u + 0x1000u * cb + 0x58u);
++		if (fsr & 0xc00001feu) {
++			r9.fcb = (int)cb;
++			r9.ffsr = fsr;
++			r9.ffar = touch_rd(sm.s, 0x40000u + 0x1000u * cb + 0x60u);
++			r9.fsyn = touch_rd(sm.s, 0x40000u + 0x1000u * cb + 0x68u);
++			r9.fsid = touch_rd(sm.s, 0x1000u + 0x400u + 4u * cb) & 0xffffu;   /* CBFRSYNRA */
++			return;
++		}
++	}
++}
++
+ static void
+ rain_smmu_arm(void)
+ {
+@@ -1062,7 +1114,9 @@ rain_gpi_xfer(uint32_t cmd, const uint8_t *tx, uint8_t *rx, unsigned n)
+ 			return -40;
+ 		}
+ 		/* DT: qcom,gpi-dma@4a00000 iommus = <&apps_smmu 0xf6 0x0> */
++		rain_smmu_pre();
+ 		rain_smmu = topaz_smmu_identity(0xf6u, 0u, "GPI0") ? 1 : 0;
++		r9.e3 = topaz_smmu_identity(0xe3u, 0u, "QUP0");
+ 		if (!rain_smmu) {
+ 			return -41;          /* no identity bank: never ring the doorbell */
+ 		}
+@@ -1411,9 +1465,10 @@ rain_touch_report(void)
+ 		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
+ 		rain_reboot_fastboot();
+ 	}
+-	panic("RAIN TOUCH C8: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	rain_smmu_cbscan();
++	panic("RAIN TOUCH C9: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+-	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x",
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+ 	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
+ 	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+@@ -1424,7 +1479,8 @@ rain_touch_report(void)
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5],
+ 	    rn.id_old[0], rn.id_old[1], rn.id_old[2], rn.id_old[3], rn.id_old[4], rn.id_old[5],
+ 	    rg.lb[0], rg.lb[1], rg.lb[2], rg.lb[3], rg.lb[4], rg.lb[5], rg.lb[6], rg.lb[7],
+-	    rn.pin_after[0], rn.pin_after[1], rn.pin_after[2], rn.pin_after[3]);
++	    rn.pin_after[0], rn.pin_after[1], rn.pin_after[2], rn.pin_after[3],
++	    r9.nvalid, r9.slot, r9.smr, r9.s2cr, r9.sctlr, r9.e3, r9.fcb, r9.ffsr, r9.ffar, r9.fsyn, r9.fsid);
+ }
+ 
+ static void
