@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 02:50:00 +0100
+Subject: [PATCH] rain-0967: touch stage B2, per-step GPI breadcrumbs
+
+Stage B reset the phone (no panic, came up in recovery) somewhere in the
+GPI bring-up or the first DMA. Print "RAIN B: <n> <step>" before each
+step and pause 3 s so the last line on screen names the step that resets
+the SoC; boot-arg raintouchstop=N stops after step N with the panic
+report (steps: 1 map/alloc, 2 SE0 GPI mode, 3 event alloc command,
+4 event context + doorbell, 5/6 channel alloc, 7/8 channel start,
+9 first transfer doorbell).
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -781,6 +781,16 @@
+ } rg;
+ 
+ static uint32_t rg_rd(uint32_t off) { return touch_rd(rg.g, off); }
++/* 0967: on-screen breadcrumbs with a pause, and raintouchstop=N to stop after step N */
++static unsigned rain_stop, rain_step;
++static bool
++rain_bc(unsigned n, const char *what)
++{
++	rain_step = n;
++	printf("RAIN B: %u %s\n", n, what);
++	touch_wait(3000);
++	return rain_stop != 0 && n > rain_stop;   /* true: stop before doing step n */
++}
+ static void rg_wr(uint32_t off, uint32_t v) { touch_wr(rg.g, off, v); }
+ 
+ /* Poll a context's state field after a command; clear the per-channel/event IRQ status. */
+@@ -812,6 +822,10 @@
+ rain_gpi_setup(void)
+ {
+ 	rg.gstage = "gpi map";
++	(void)PE_parse_boot_argn("raintouchstop", &rain_stop, sizeof(rain_stop));
++	if (rain_bc(1, "map + alloc")) {
++		return -40;
++	}
+ 	rg.g = ml_io_map(RG_PA, 0x4000);
+ 	if (!rg.g) {
+ 		return -20;
+@@ -834,6 +848,9 @@
+ 		return -23;                     /* someone else owns GPII 0: touch nothing */
+ 	}
+ 
++	if (rain_bc(2, "se0 gpi mode")) {
++		return -40;
++	}
+ 	/* SE0 into GPI mode (qcom-geni-se: select_gpi_mode) */
+ 	touch_wr(rn.se, 0xe1c, 0);
+ 	touch_wr(rn.se, SE_IRQ_EN, 0);
+@@ -843,12 +860,18 @@
+ 	rg_wr(RG_INTSET, 1);
+ 
+ 	rg.gstage = "ev alloc";
++	if (rain_bc(3, "ev alloc cmd")) {
++		return -40;
++	}
+ 	rg_wr(RG_EV_CMD, (0u << 24) | 0u);
+ 	if (!rain_gpi_wait(RG_EV, 1)) {
+ 		rg.st_ev = rg_rd(RG_EV + RC_CFG);
+ 		return -24;
+ 	}
+ 	rg.st_ev = rg_rd(RG_EV + RC_CFG);
++	if (rain_bc(4, "ev ctx + doorbell")) {
++		return -40;
++	}
+ 	rain_gpi_ring_ctx(RG_EV, (16u << 24) | (1u << 16) | 2u, RM_EV, RG_NEV * 16u, RG_EV_DB);
+ 	rg_wr(RG_EV + RC_INTMOD, 0);
+ 	rg_wr(RG_EV + RC_MSI_LO, 0);
+@@ -860,6 +883,9 @@
+ 
+ 	for (uint32_t k = 0; k < 2; k++) {
+ 		rg.gstage = k ? "ch1 alloc" : "ch0 alloc";
++		if (rain_bc(5u + k, rg.gstage)) {
++			return -40;
++		}
+ 		rg_wr(RG_CH_CMD, (0u << 24) | k);
+ 		bool alloc_ok = rain_gpi_wait(RG_CH(k), 1);
+ 		if (k) {
+@@ -882,6 +908,9 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	for (uint32_t k = 0; k < 2; k++) {
+ 		rg.gstage = k ? "ch1 start" : "ch0 start";
++		if (rain_bc(7u + k, rg.gstage)) {
++			return -40;
++		}
+ 		rg_wr(RG_CH_CMD, (1u << 24) | k);
+ 		bool ok = rain_gpi_wait(RG_CH(k), 2);
+ 		if (k) {
+@@ -938,6 +967,9 @@
+ 	clean_dcache64((addr64_t)(rg.pa + RM_TXBUF), 0x100, TRUE);
+ 	flush_dcache64((addr64_t)(rg.pa + RM_RXBUF), 0x100, TRUE);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	if (rn.xfers == 0 && rain_bc(9, "first doorbell (DMA)")) {
++		return -40;
++	}
+ 	if (cmd == 3u) {
+ 		rg.rx_wp += 1u;
+ 		rg_wr(RG_CH_DB(1), (uint32_t)(rg.pa + RM_RX + rg.rx_wp * 16u));
+@@ -1207,10 +1239,10 @@
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH B: '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH B2: step %u '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+-	    rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.ifdis,
++	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.ifdis,
+ 	    rg.pre_ch0, rg.pre_ch1, rg.pre_ev, rg.st_ev, rg.st_ch0, rg.st_ch1, rg.st_go0, rg.st_go1,
+ 	    rg.f_ch0, rg.f_ch1, rg.f_rp0, rg.f_wp0, rg.f_evrp, rg.f_type, rg.f_glob, rg.f_gpii,
+ 	    rg.f_err, rg.f_srcch, rg.nev, rg.ev_w2, rg.ev_w3, (unsigned long long)rg.pa,
