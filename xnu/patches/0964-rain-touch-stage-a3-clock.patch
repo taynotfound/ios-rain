@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 01:40:00 +0100
+Subject: [PATCH] rain-0964: touch stage A3, SE0 clock evidence and forced-root retry
+
+On the phone SE0 accepts the first SPI command and drains its TX FIFO but
+never finishes (M_CMD_ACTIVE, no IRQ), while all SPI config reads back as
+written: the serial clock is suspected. Record the S0 RCG command register
+(ROOT_OFF), both candidate branch registers and the known-good SE2 RCG,
+wait up to 200 ms per command, and on a hang set ROOT_EN and retry once.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -653,6 +653,9 @@
+ 	bool snapped;
+ 	uint32_t f_op, f_n, f_irq, f_status, f_txfs, f_rxfs, f_ios, f_sirq;
+ 	uint32_t c_mclk, c_clksel, c_word, c_cpha, c_cpol, c_demux, c_trans, c_cgc, c_dma, c_pack0;
++	/* 0964: clock tree evidence and a forced-root retry */
++	uint32_t k_cmd, k_b138, k_b144, k_se2cmd, k_se2cfg, k_cmd2;
++	int retry_err;
+ } rn;
+ 
+ static void
+@@ -695,7 +698,7 @@
+ 		touch_wr(se, SE_TX, w);
+ 	}
+ 	unsigned got = 0;
+-	for (unsigned spin = 0; spin < 20000; spin++) {
++	for (unsigned spin = 0; spin < 200000; spin++) {
+ 		uint32_t irq = touch_rd(se, SE_IRQ);
+ 		while (op == RAIN_OP_FULL && got < n && (touch_rd(se, SE_RX_COUNT) & 0x1ffffffu)) {
+ 			uint32_t w = touch_rd(se, SE_RX);
+@@ -848,9 +851,23 @@
+ 	rn.c_dma = touch_rd(rn.se, SE_DMA);
+ 	rn.c_pack0 = touch_rd(rn.se, 0x260);
+ 	rn.cbcr = touch_rd(st.gcc, RAIN_RCG_SE0 - 4u);   /* branch state after the wait */
++	rn.k_cmd = touch_rd(st.gcc, RAIN_RCG_SE0);          /* bit 31 ROOT_OFF, bit 1 ROOT_EN */
++	rn.k_b138 = touch_rd(st.gcc, 0x1f138u);            /* candidate SE0 branch (halt) register */
++	rn.k_b144 = touch_rd(st.gcc, 0x1f144u);
++	rn.k_se2cmd = touch_rd(st.gcc, TOUCH_RCG);         /* topaz SE2, known good, read only */
++	rn.k_se2cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+ 
+ 	rn.stage = "nvt reset";
+ 	int e = rain_nvt_write(RAIN_NVT_RST, 0x69);
++	if (e == -4) {
++		rn.stage = "retry root_en";
++		touch_wr(st.gcc, RAIN_RCG_SE0, touch_rd(st.gcc, RAIN_RCG_SE0) | 2u);   /* ROOT_EN */
++		delay(100);
++		rn.k_cmd2 = touch_rd(st.gcc, RAIN_RCG_SE0);
++		e = rain_nvt_write(RAIN_NVT_RST, 0x69);
++		rn.retry_err = e;
++		rn.stage = "nvt reset";
++	}
+ 	touch_wait(5);
+ 	if (!e) {
+ 		e = rain_nvt_write(RAIN_NVT_RDFAST, 0x00);
+@@ -869,13 +886,13 @@
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH A2: '%s' err=%d xf=%u cbcr=%#x | FAIL op=%u n=%u irq=%#x st=%#x "
+-	    "txfs=%#x rxfs=%#x ios=%#x sirq=%#x | CFG mclk=%#x sel=%#x word=%#x cpha=%#x cpol=%#x "
+-	    "demux=%#x trans=%#x cgc=%#x dma=%#x pack=%#x | id %02x %02x %02x %02x %02x %02x",
+-	    rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.cbcr,
+-	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs, rn.f_rxfs, rn.f_ios, rn.f_sirq,
+-	    rn.c_mclk, rn.c_clksel, rn.c_word, rn.c_cpha, rn.c_cpol, rn.c_demux, rn.c_trans,
+-	    rn.c_cgc, rn.c_dma, rn.c_pack0,
++	panic("RAIN TOUCH A3: '%s' err=%d retry=%d xf=%u | CLK cmd=%#x cmd2=%#x cfg=%#x b144=%#x b138=%#x "
++	    "vote=%#x | SE2 cmd=%#x cfg=%#x | FAIL op=%u n=%u irq=%#x st=%#x txfs=%#x ios=%#x | "
++	    "id %02x %02x %02x %02x %02x %02x",
++	    rn.stage ? rn.stage : "?", rn.err, rn.retry_err, rn.xfers,
++	    rn.k_cmd, rn.k_cmd2, rn.rcgcfg, rn.k_b144, rn.k_b138, rn.vote,
++	    rn.k_se2cmd, rn.k_se2cfg,
++	    rn.f_op, rn.f_n, rn.f_irq, rn.f_status, rn.f_txfs, rn.f_ios,
+ 	    rn.id[0], rn.id[1], rn.id[2], rn.id[3], rn.id[4], rn.id[5]);
+ }
+ 
