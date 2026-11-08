@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sun, 8 Nov 2026 03:25:00 +0100
+Subject: [PATCH] rain-0969: touch probe can end by rebooting into fastboot
+
+The probe panic is invisible once iOS has taken the scanout or turned
+the panel off. Boot-arg raintouchfb=1 ends the probe instead by setting
+the IMEM restart reason to "bootloader" (as the shim does) and issuing
+PSCI SYSTEM_RESET (PS_HOLD low as a fallback), so the outcome reads off
+where the phone lands: fastboot = stop point reached, another reboot =
+crash, no reboot = hang.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1244,10 +1244,42 @@
+ 	rn.stage = "done";
+ }
+ 
++/*
++ * 0969: raintouchfb=1 ends the probe by rebooting into fastboot instead of
++ * panicking, so the outcome is readable with the panel off or covered by
++ * iOS: fastboot = stop point reached, other reboot = crash, none = hang.
++ * Same method as the shim: IMEM restart reason "bootloader", then PSCI
++ * SYSTEM_RESET, then PS_HOLD low as a fallback.
++ */
++static void
++rain_reboot_fastboot(void)
++{
++	vm_offset_t imem = ml_io_map(0x0c125000u, 0x1000);   /* qcom,msm-imem restart_reason@65c */
++	vm_offset_t pshold = ml_io_map(0x0440b000u, 0x1000);
++	if (imem) {
++		touch_wr(imem, 0x65cu, 0x77665500u);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009u;    /* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	if (pshold) {
++		touch_wr(pshold, 0, 0);
++	}
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
+ static void
+ rain_touch_report(void)
+ {
+-	panic("RAIN TOUCH B3: step %u '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	uint32_t fb = 0;
++	(void)PE_parse_boot_argn("raintouchfb", &fb, sizeof(fb));
++	if (fb) {
++		printf("RAIN TOUCH: step %u err=%d, rebooting to fastboot\n", rain_step, rn.err);
++		rain_reboot_fastboot();
++	}
++	panic("RAIN TOUCH B4: step %u '%s' err=%d xf=%u ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x pa=%#llx | id %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rn.ifdis,
