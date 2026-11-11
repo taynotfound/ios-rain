@@ -8,8 +8,8 @@
 set -e
 cd "$(dirname "$0")/.."
 P=$PWD R=$1 N=$2 T=$3
-gh run watch "$R" -R taynotfound/ios-topaz --exit-status -i 30 >/dev/null
-rm -rf "xnu/out-$N" && gh run download "$R" -R taynotfound/ios-topaz -n xnu-kernel -D "xnu/out-$N"
+gh run watch "$R" -R taynotfound/ios-rain --exit-status -i 30 >/dev/null
+rm -rf "xnu/out-$N" && gh run download "$R" -R taynotfound/ios-rain -n xnu-kernel -D "xnu/out-$N"
 (cd "xnu/out-$N" && sha256sum -c SHA256SUMS)
 FW=research/fw-fog/novatek_ts_fw.bin
 python3 tools/mkpayload.py "xnu/out-$N/kernel.development.sweet" build-rain/rain-ios.adt "build-rain/payload-$T.bin" \

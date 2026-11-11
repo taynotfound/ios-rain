@@ -3,6 +3,7 @@
 - Read `PORTING-rain.md` before starting: hardware facts, the boot log of every test
   image, the current blocker and the next step. `NOTES.md` and `docs/UPSTREAM-topaz.md`
   are the upstream projects' logs (other phones).
+- Repo: github.com/taynotfound/ios-rain, branch `rain` (remote `fork`; `origin` is upstream MakrSas/ios-topaz). Kernel builds: `gh workflow run xnu.yml -R taynotfound/ios-rain --ref rain`; GPU user space: `userland.yml`.
 - The user switches agents frequently. Update `PORTING-rain.md`
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
