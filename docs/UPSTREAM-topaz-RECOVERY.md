@@ -1,3 +1,5 @@
+> **Upstream runbook for the Redmi Note 12 4G (`topaz`). Do not use it on a Redmi 10C:** the partition tables and ROM named here belong to a different phone.
+
 # topaz: back to stock / recovery runbook
 
 Redmi Note 12 4G (`topaz`, ROM codename `tapas`), SM6225. Everything below runs on **s8build**

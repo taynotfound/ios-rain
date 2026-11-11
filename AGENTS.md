@@ -1,8 +1,9 @@
-# Working on ios-sweet
+# Working on this repo (iOS on Redmi 10C, `rain`)
 
-- Read `NOTES.md` before starting; it contains the project goal, hardware facts,
-  current blocker, local artifact locations and the next concrete action.
-- The user switches agents frequently. Update the active handoff in `NOTES.md`
+- Read `PORTING-rain.md` before starting: hardware facts, the boot log of every test
+  image, the current blocker and the next step. `NOTES.md` and `docs/UPSTREAM-topaz.md`
+  are the upstream projects' logs (other phones).
+- The user switches agents frequently. Update `PORTING-rain.md`
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
 - Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs.

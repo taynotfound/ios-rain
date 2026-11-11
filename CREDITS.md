@@ -1,5 +1,15 @@
 # Credits and licences
 
+## This fork: Redmi 10C (`rain`)
+
+This repository is a fork of **[MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz)** (forked at
+`e477291`), which runs the same software on the Redmi Note 12 4G. ios-topaz is itself a port of
+**[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)**. Everything below is their
+credits text, unchanged; where it says "here" or "our changes for topaz" it means ios-topaz.
+The Redmi 10C work (kernel patches `0960` and up, `build-rain/`, `PORTING-rain.md`) follows the
+licences of the files it changes: APSL 2.0 for the XNU patches. The Novatek touch code follows
+Xiaomi's published GPL-2.0 kernel driver (`nt36xxx`) as a hardware reference.
+
 ## HackiOS (OOSEX GANG)
 
 Much of the GPU, display, audio, Wi-Fi glue and sandbox work here started from **HackiOS**, which
