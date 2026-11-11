@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 20:20:00 +0100
+Subject: [PATCH] rain-0984: touch survives screen off/on
+
+Locking the screen broke touch for good: DCS sleep in stops the NT36525B
+touch scan while its firmware info stays readable, so the 0983 liveness
+check never fired. AppleCLCD::setPanelOn now tells the touch driver:
+no polling while the panel sleeps, a fresh firmware download on wake.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ca4c01f..4390193 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1490,6 +1490,24 @@ static void rain_touch_report(void);
+  * Xiaomi's driver reloads on every resume. Here: once a second read the firmware info
+  * (version + ~version = 0xff) and reload after two bad readings in a row.
+  */
++/*
++ * Set by the framebuffer driver around DCS sleep in / sleep out. Sleep stops the touch
++ * scan although the firmware info stays readable, so the liveness check alone misses it:
++ * no polling while the panel is off, a fresh download when it comes back.
++ */
++static volatile int rain_panel_off, rain_panel_woke;
++
++void rain_touch_panel(int on);
++
++void
++rain_touch_panel(int on)
++{
++	rain_panel_off = !on;
++	if (on) {
++		rain_panel_woke = 1;
++	}
++}
++
+ static bool
+ rain_nvt_alive(void)
+ {
+@@ -1506,7 +1524,7 @@ rain_nvt_reload(void)
+ 	int e = rain_nvt_download(nf.fw, nf.fwlen);
+ 	nf.reloads++;
+ 	nf.reload_fail += e != 0;
+-	printf("RAIN TOUCH: firmware lost, reload %u err=%d\n", nf.reloads, e);
++	printf("RAIN TOUCH: firmware reload %u err=%d\n", nf.reloads, e);
+ 	touch_wait(50);
+ }
+ 
+@@ -1522,6 +1540,17 @@ rain_touch_run(unsigned stop)
+ 	for (;;) {
+ 		int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
+ 		uint32_t mask = 0;
++		if (rain_panel_off) {
++			touch_report(0, st.x, st.y);
++			touch_wait(50);
++			continue;
++		}
++		if (rain_panel_woke) {
++			rain_panel_woke = 0;
++			touch_wait(150);                        /* display on follows sleep out by 120 ms */
++			rain_nvt_reload();
++			dead = 0;
++		}
+ 		if (++tick % 100u == 0) {
+ 			dead = rain_nvt_alive() ? 0 : dead + 1;
+ 			if (dead >= 2) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d3ee17..bd92d1e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1041,6 +1041,8 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+  * last frame); on = 0x11 sleep out, 120 ms, 0x29 display on (the caller
+  * then sends the brightness).
+  */
++extern "C" void rain_touch_panel(int on);
++
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
+@@ -1062,6 +1064,7 @@ AppleCLCD::setPanelOn(bool on)
+ 	}
+ 	IOLog("SWEET FB: panel %s: %s\n", on ? "sleep out, display on" : "display off, sleep in",
+ 	    done ? "done" : "NO DONE");
++	rain_touch_panel(on);        /* rain: the panel IC is the touch controller too */
+ }
+ 
+ void

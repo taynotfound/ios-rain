@@ -209,6 +209,24 @@ static void rain_touch_report(void);
  * Xiaomi's driver reloads on every resume. Here: once a second read the firmware info
  * (version + ~version = 0xff) and reload after two bad readings in a row.
  */
+/*
+ * Set by the framebuffer driver around DCS sleep in / sleep out. Sleep stops the touch
+ * scan although the firmware info stays readable, so the liveness check alone misses it:
+ * no polling while the panel is off, a fresh download when it comes back.
+ */
+static volatile int rain_panel_off, rain_panel_woke;
+
+void rain_touch_panel(int on);
+
+void
+rain_touch_panel(int on)
+{
+	rain_panel_off = !on;
+	if (on) {
+		rain_panel_woke = 1;
+	}
+}
+
 static bool
 rain_nvt_alive(void)
 {
@@ -225,7 +243,7 @@ rain_nvt_reload(void)
 	int e = rain_nvt_download(nf.fw, nf.fwlen);
 	nf.reloads++;
 	nf.reload_fail += e != 0;
-	printf("RAIN TOUCH: firmware lost, reload %u err=%d\n", nf.reloads, e);
+	printf("RAIN TOUCH: firmware reload %u err=%d\n", nf.reloads, e);
 	touch_wait(50);
 }
 
@@ -241,6 +259,17 @@ rain_touch_run(unsigned stop)
 	for (;;) {
 		int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
 		uint32_t mask = 0;
+		if (rain_panel_off) {
+			touch_report(0, st.x, st.y);
+			touch_wait(50);
+			continue;
+		}
+		if (rain_panel_woke) {
+			rain_panel_woke = 0;
+			touch_wait(150);                        /* display on follows sleep out by 120 ms */
+			rain_nvt_reload();
+			dead = 0;
+		}
 		if (++tick % 100u == 0) {
 			dead = rain_nvt_alive() ? 0 : dead + 1;
 			if (dead >= 2) {
