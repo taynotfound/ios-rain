@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ios-rain · iOS 16 on a Redmi 10C</title>
+<meta name="description" content="ios-rain boots Apple's XNU kernel and the iPhone X's iOS 16 userland on a Xiaomi Redmi 10C. A hobby port by Tay März.">
+<meta property="og:title" content="ios-rain · iOS 16 on a Redmi 10C">
+<meta property="og:description" content="Apple's XNU kernel and iOS 16 on a Xiaomi Redmi 10C: home screen, touch and GPU working.">
+<meta property="og:image" content="img/hero.jpg">
+<meta name="theme-color" content="#141210">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600;700&display=swap">
+<style>
+/* tay.märz brand: dark ink bands, cream text, hoodie green, amber chapter tags. */
+:root {
+  --ink: #141210; --ink-raised: #1c1916; --ink-deep: #0e0c0b;
+  --line: #2a2622; --line-strong: #3a342e;
+  --cream: #eee7dc; --cream-soft: #cfc6b9; --muted: #a39a8e; --faint: #8f877b;
+  --green: #0f6b54; --green-bright: #2fb08c; --mint: #7fd4b6; --green-pale: #d6ede4;
+  --brown: #6e3410; --brown-pale: #f2d9c4; --amber: #e68a3a; --on-cream-soft: #4a4038;
+  --display: 'Bricolage Grotesque', ui-sans-serif, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  --gutter: clamp(16px, 5vw, 72px);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+body { margin: 0; background: var(--ink); color: var(--cream); font-family: var(--display); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; overflow-x: clip; }
+h1, h2, h3, h4, p, ul, ol, figure, dl, dd { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+h1, h2, h3, h4 { font-weight: 800; letter-spacing: -0.035em; line-height: 1.02; text-wrap: balance; }
+p { text-wrap: pretty; }
+a { color: var(--mint); text-decoration: none; }
+a:hover { color: var(--cream); }
+:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; border-radius: 6px; }
+img { display: block; max-width: 100%; height: auto; }
+code, .mono { font-family: var(--mono); }
+code { font-size: .88em; color: var(--mint); }
+
+.band { border-bottom: 1px solid var(--line); }
+.band--deep { background: var(--ink-deep); }
+.inner { max-width: 1320px; margin-inline: auto; padding-left: max(var(--gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--gutter), env(safe-area-inset-right, 0px)); padding-block: clamp(64px, 9vw, 120px); }
+.chapter { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; font-family: var(--mono); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; color: var(--amber); }
+.chapter::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.h2 { font-size: clamp(40px, 5.6vw, 80px); letter-spacing: -0.045em; line-height: .95; }
+.lede { font-size: clamp(18px, 1.6vw, 21px); color: var(--cream-soft); max-width: 60ch; margin-top: 20px; }
+
+/* wordmark: the ä dots are eyes */
+.wm { --fg: var(--cream); --bg: var(--ink); --dot: #0f8a6c; display: inline-block; font-weight: 800; letter-spacing: -0.05em; line-height: 1; color: var(--fg); white-space: nowrap; }
+.wm .d { color: var(--dot); }
+.wm .a { position: relative; display: inline-block; }
+.eye { position: absolute; top: .03em; width: .23em; height: .23em; border-radius: 50%; background: var(--fg); display: grid; place-items: center; overflow: hidden; }
+.eye.l { left: .02em; } .eye.r { left: .29em; }
+.pupil { position: relative; width: 76%; height: 76%; border-radius: 50%; background: var(--bg); transform: translate(var(--px, 0), var(--py, 0)); transition: transform 140ms cubic-bezier(.22,1,.36,1); }
+.glint { position: absolute; right: 14%; top: 14%; width: 32%; height: 32%; border-radius: 50%; background: var(--fg); }
+
+.ear { position: relative; display: inline-flex; align-items: center; gap: 8px; width: fit-content; margin-top: 8px; padding: 6px 14px 5px; border-radius: 10px; background: var(--ear-bg, var(--ink-raised)); color: var(--ear-fg, var(--cream-soft)); font-family: var(--mono); font-size: 12.5px; font-weight: 600; letter-spacing: .08em; line-height: 1.3; text-transform: uppercase; white-space: nowrap; }
+.ear::before, .ear::after { content: ''; position: absolute; top: -8px; width: 13px; height: 10px; background: var(--ear-bg, var(--ink-raised)); }
+.ear::before { left: 9px; clip-path: polygon(0 100%, 25% 0, 100% 100%); }
+.ear::after { right: 9px; clip-path: polygon(0 100%, 75% 0, 100% 100%); }
+.ear--green { --ear-bg: var(--green); --ear-fg: var(--cream); }
+.ear--cream { --ear-bg: var(--cream); --ear-fg: var(--ink); }
+.ear--brown { --ear-bg: var(--brown); --ear-fg: var(--cream); }
+
+.pulse { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--green-bright); flex-shrink: 0; }
+.pulse::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: inherit; animation: pulse 2.4s cubic-bezier(.22,1,.36,1) infinite; }
+@keyframes pulse { from { transform: scale(1); opacity: .7; } to { transform: scale(3); opacity: 0; } }
+
+.btn { display: inline-flex; align-items: center; gap: 10px; min-height: 48px; padding: 12px 24px; border-radius: 999px; background: var(--green); color: var(--cream); font-weight: 600; white-space: nowrap; border: 1px solid transparent; }
+.btn:hover { color: var(--cream); background: #128063; }
+.btn--ghost { background: transparent; border-color: var(--line-strong); color: var(--cream-soft); }
+.btn--ghost:hover { background: var(--ink-raised); }
+.btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 32px; }
+
+/* cover */
+.cover .inner { padding-block: clamp(24px, 4vw, 44px) 0; }
+.meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; font-family: var(--mono); font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.cover-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: clamp(24px, 4vw, 56px); align-items: center; margin-top: clamp(36px, 6vw, 80px); padding-bottom: clamp(48px, 7vw, 96px); }
+.status { display: inline-flex; align-items: center; gap: 10px; margin-bottom: 28px; padding: 7px 14px; border: 1px solid var(--line-strong); border-radius: 999px; font-family: var(--mono); font-size: 13px; color: var(--cream-soft); }
+.title { font-size: clamp(64px, 11vw, 168px); letter-spacing: -0.055em; line-height: .88; }
+.claim { margin-top: clamp(16px, 2.4vw, 28px); font-size: clamp(26px, 3.2vw, 46px); font-weight: 800; letter-spacing: -0.035em; line-height: 1.04; color: var(--mint); }
+.motto { margin-top: 12px; font-family: var(--mono); color: var(--muted); font-size: clamp(14px, 1.2vw, 16px); }
+.hero { border-radius: 24px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 30px 80px rgba(0,0,0,.5); }
+.toc { display: flex; flex-wrap: wrap; gap: 8px 22px; padding-block: 20px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 13px; }
+.toc a { color: var(--muted); }
+.toc a:hover { color: var(--cream); }
+.toc b { color: var(--amber); font-weight: 600; margin-right: 6px; }
+
+/* facts */
+.facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--line); margin-top: clamp(36px, 5vw, 56px); }
+.facts div { display: flex; flex-direction: column-reverse; justify-content: flex-end; gap: 6px; padding: 28px 24px; border-left: 1px solid var(--line); }
+.facts div:first-child { border-left: 0; padding-left: 0; }
+.facts dd { font-size: clamp(40px, 5vw, 68px); font-weight: 800; letter-spacing: -.05em; line-height: 1; font-variant-numeric: tabular-nums; }
+.facts dt { color: var(--muted); font-size: 15px; }
+
+/* status groups */
+.groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: clamp(36px, 5vw, 56px); }
+.group { --c-bg: var(--green); --c-fg: var(--cream); --c-soft: var(--green-pale); --c-line: rgba(238,231,220,.18); display: flex; flex-direction: column; gap: 10px; padding: clamp(24px, 3vw, 36px); border-radius: 24px; background: var(--c-bg); color: var(--c-fg); }
+.group--wip { --c-bg: var(--cream); --c-fg: var(--ink); --c-soft: var(--on-cream-soft); --c-line: rgba(20,18,16,.14); }
+.group--todo { --c-bg: var(--brown); --c-soft: var(--brown-pale); }
+.group h3 { font-size: clamp(26px, 2.4vw, 34px); }
+.group li { padding: 14px 0; border-top: 1px solid var(--c-line); }
+.group h4 { font-size: 19px; letter-spacing: -.02em; }
+.group p { color: var(--c-soft); font-size: 15px; margin-top: 2px; }
+
+/* journey */
+.journey { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: clamp(36px, 5vw, 56px); }
+.shot { display: grid; gap: 12px; align-content: start; min-width: 0; }
+.shot .frame { aspect-ratio: 3 / 4; border-radius: 18px; overflow: hidden; background: var(--ink-raised); border: 1px solid var(--line); }
+.shot img { width: 100%; height: 100%; object-fit: cover; }
+.shot .when { font-family: var(--mono); font-size: 12.5px; color: var(--amber); letter-spacing: .06em; text-transform: uppercase; }
+.shot h3 { font-size: 21px; letter-spacing: -.02em; }
+.shot p { color: var(--muted); font-size: 15px; }
+
+/* gallery of the home screen */
+.home { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr) minmax(0, 1.2fr); gap: 16px; margin-top: clamp(36px, 5vw, 56px); align-items: stretch; }
+.home figure { border-radius: 24px; overflow: hidden; border: 1px solid var(--line); background: var(--ink-raised); }
+.home img { width: 100%; height: 100%; object-fit: cover; }
+
+/* boot chain */
+.chain { display: grid; gap: 0; margin-top: clamp(32px, 4vw, 48px); counter-reset: step; }
+.chain li { counter-increment: step; display: grid; grid-template-columns: 3.2em minmax(0, 1fr); gap: 16px; padding: 18px 0; border-top: 1px solid var(--line); }
+.chain li::before { content: counter(step, decimal-leading-zero); font-family: var(--mono); font-weight: 700; color: var(--green-bright); padding-top: 2px; }
+.chain h3 { font-size: 21px; letter-spacing: -.02em; }
+.chain p { color: var(--muted); font-size: 15.5px; margin-top: 2px; }
+
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: clamp(28px, 6vw, 96px); align-items: start; }
+.cards { display: grid; gap: 12px; }
+.card { padding: 22px 24px; border-radius: 18px; border: 1px solid var(--line); display: grid; gap: 6px; }
+.card .tag { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--amber); }
+.card h3 { font-size: clamp(20px, 2vw, 26px); }
+.card p { color: var(--muted); font-size: 15.5px; }
+.warn { margin-top: 28px; padding: 20px 24px; border-radius: 18px; background: var(--ink-raised); border-left: 3px solid var(--amber); color: var(--cream-soft); font-size: 15.5px; }
+
+.footer .inner { padding-block: 48px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: 24px; }
+.footer .wm { font-size: clamp(48px, 7vw, 96px); }
+.footer p { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+.footer nav { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--mono); font-size: 13px; margin-top: 10px; }
+
+@media (max-width: 1080px) {
+  .journey { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 860px) {
+  .cover-grid, .two, .groups { grid-template-columns: 1fr; }
+  .facts { grid-template-columns: 1fr 1fr; }
+  .facts div:nth-child(3) { border-left: 0; padding-left: 0; }
+  .facts div:nth-child(n + 3) { border-top: 1px solid var(--line); }
+  .home { grid-template-columns: 1fr 1fr; }
+  .home figure:first-child { grid-row: span 2; }
+}
+@media (max-width: 560px) {
+  .journey { grid-template-columns: 1fr 1fr; gap: 12px; }
+  .shot h3 { font-size: 18px; }
+  .home { grid-template-columns: 1fr; }
+  .home figure:first-child { grid-row: auto; }
+  .facts div { padding: 20px 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="band cover">
+  <div class="inner">
+    <div class="meta"><span>ios-rain · Redmi 10C</span><span>Snapdragon 680 · iOS 16.7.16</span></div>
+    <div class="cover-grid">
+      <div>
+        <p class="status"><span class="pulse" aria-hidden="true"></span>Home screen, touch and GPU working</p>
+        <h1 class="title">ios-rain</h1>
+        <p class="claim">iOS 16 on a Redmi 10C.</p>
+        <p class="motto">Apple's XNU kernel and the iPhone X userland, on a budget Android phone.</p>
+        <div class="btns">
+          <a class="btn" href="https://github.com/taynotfound/ios-rain">Source on GitHub</a>
+          <a class="btn btn--ghost" href="#journey">See the journey</a>
+        </div>
+      </div>
+      <figure class="hero"><img src="img/hero.jpg" width="1800" height="939" alt="A Redmi 10C showing the iOS home screen, with the title ios-rain by Tay März"></figure>
+    </div>
+    <nav class="toc" aria-label="Sections">
+      <a href="#status"><b>01</b>Status</a>
+      <a href="#journey"><b>02</b>Journey</a>
+      <a href="#how"><b>03</b>How it boots</a>
+      <a href="#credits"><b>04</b>Credits</a>
+    </nav>
+  </div>
+</header>
+
+<section class="band" id="status">
+  <div class="inner">
+    <p class="chapter">01 · Status</p>
+    <h2 class="h2">Where it stands.</h2>
+    <p class="lede">The phone boots its own kernel image, reaches the iOS home screen, takes touch input and draws through its own Adreno GPU. It is a bring-up, not a phone you could use every day: frame rate, battery reading and sound are the next pieces.</p>
+    <dl class="facts">
+      <div><dt>Gold CPU cores in use</dt><dd>4</dd></div>
+      <div><dt>panel, 720 × 1650</dt><dd>6.7″</dd></div>
+      <div><dt>logged test boots</dt><dd>64</dd></div>
+      <div><dt>kernel patches for this phone</dt><dd>31</dd></div>
+    </dl>
+    <div class="groups">
+      <div class="group">
+        <span class="ear ear--cream">Works</span>
+        <h3>Running</h3>
+        <ul>
+          <li><h4>Boot</h4><p>Stock bootloader, our shim, XNU on a Cortex-A73 core. Boots from the phone's own boot slot, no PC needed.</p></li>
+          <li><h4>iOS 16 userland</h4><p>iPhone X root on an HFS+ volume, lock screen, home screen, Settings.</p></li>
+          <li><h4>Display</h4><p>The 1125 × 2436 iPhone canvas, scaled to the 720-wide panel.</p></li>
+          <li><h4>Touch and keys</h4><p>Novatek NT36525B over SPI with its firmware uploaded at boot; volume and lock keys.</p></li>
+          <li><h4>GPU</h4><p>Adreno 610 through Mesa freedreno behind CoreAnimation.</p></li>
+          <li><h4>Live log</h4><p>The kernel streams its log to a PC over the USB cable.</p></li>
+        </ul>
+      </div>
+      <div class="group group--wip">
+        <span class="ear ear--green">In progress</span>
+        <h3>Being built</h3>
+        <ul>
+          <li><h4>Smoothness</h4><p>About 15 frames a second today: every frame is shrunk by the CPU. The fix is to let the display hardware scale.</p></li>
+          <li><h4>Battery</h4><p>Finding the SM5602 fuel gauge on this board, so iOS shows a real percentage.</p></li>
+          <li><h4>Escape combo</h4><p>Volume up + down for 3 seconds to reboot into fastboot, even when iOS hangs.</p></li>
+        </ul>
+      </div>
+      <div class="group group--todo">
+        <span class="ear ear--cream">Not yet</span>
+        <h3>Ahead</h3>
+        <ul>
+          <li><h4>Audio</h4><p>Amplifier driver is ready; the audio DSP speaks Qualcomm's older APR protocol and needs its own driver.</p></li>
+          <li><h4>Wi-Fi</h4><p>The modem path exists upstream; it needs this phone's firmware layout.</p></li>
+          <li><h4>Cellular, Bluetooth, camera</h4><p>Not planned for now.</p></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band band--deep" id="journey">
+  <div class="inner">
+    <p class="chapter">02 · Journey</p>
+    <h2 class="h2">From a red screen to a home screen.</h2>
+    <p class="lede">Most of this was debugged one panic screen at a time, photographed off the phone. Every step below is a real photo.</p>
+    <ol class="journey">
+      <li class="shot"><div class="frame"><img src="img/01-shim.jpg" loading="lazy" alt="Red screen with the boot shim's register dump"></div><span class="when">7 Nov</span><h3>The shim talks</h3><p>Our boot shim draws its first lines and hands off to a Gold core.</p></li>
+      <li class="shot"><div class="frame"><img src="img/02-xnu.jpg" loading="lazy" alt="White kernel console text scrolling on the phone"></div><span class="when">7 Nov</span><h3>XNU runs</h3><p>Apple's kernel boots on the phone and scrolls its console.</p></li>
+      <li class="shot"><div class="frame"><img src="img/03-apple-logo.jpg" loading="lazy" alt="The Apple logo on the Redmi screen"></div><span class="when">8 Nov</span><h3>The Apple logo</h3><p>iOS starts from the flashed root volume.</p></li>
+      <li class="shot"><div class="frame"><img src="img/04-lock-screen.jpg" loading="lazy" alt="iOS lock screen showing 4:16"></div><span class="when">8 Nov</span><h3>Lock screen</h3><p>After a long first boot, the iOS lock screen appears.</p></li>
+      <li class="shot"><div class="frame"><img src="img/05-lock-fit.jpg" loading="lazy" alt="Lock screen fitted to the narrower panel"></div><span class="when">8 Nov</span><h3>Fit to screen</h3><p>The iPhone canvas is scaled to fit the 720-pixel panel.</p></li>
+      <li class="shot"><div class="frame"><img src="img/06-touch-id.jpg" loading="lazy" alt="Diagnostic panic text with the touch chip's ID"></div><span class="when">8 Nov</span><h3>The touch chip answers</h3><p>After many probes, SPI reads return the NT36525B's ID.</p></li>
+      <li class="shot"><div class="frame"><img src="img/07-touch.jpg" loading="lazy" alt="Diagnostic text showing a finger being tracked"></div><span class="when">11 Nov</span><h3>A finger, tracked</h3><p>Firmware uploaded, one finger followed across the screen.</p></li>
+      <li class="shot"><div class="frame"><img src="img/08-gpu-panic.jpg" loading="lazy" alt="Panic text from the first GPU boot"></div><span class="when">11 Nov</span><h3>The GPU wakes up</h3><p>Two memory fixes later, the Adreno draws iOS.</p></li>
+    </ol>
+    <div class="home" aria-label="The home screen on the phone">
+      <figure><img src="img/09-home.jpg" loading="lazy" alt="iOS home screen on the Redmi 10C, seen from above"></figure>
+      <figure><img src="img/10-home-desk.jpg" loading="lazy" alt="The phone on a desk showing the iOS home screen"></figure>
+      <figure><img src="img/11-home-angle.jpg" loading="lazy" alt="Close angle of the iOS dock with Phone, Safari and Messages"></figure>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="how">
+  <div class="inner two">
+    <div>
+      <p class="chapter">03 · How it boots</p>
+      <h2 class="h2">No Android underneath.</h2>
+      <p class="lede">The phone's own Xiaomi bootloader starts a tiny shim. From there it is Apple's kernel and Apple's userland, with drivers written for this hardware.</p>
+    </div>
+    <ol class="chain">
+      <li><div><h3>Xiaomi bootloader</h3><p>Loads our boot image like any Android kernel, from USB or the boot partition.</p></div></li>
+      <li><div><h3>Boot shim</h3><p>Moves from the Silver cores, which lack 16 KB pages, to a Cortex-A73 Gold core, then loads XNU.</p></div></li>
+      <li><div><h3>XNU</h3><p>Apple's open-source kernel with patches for the SM6225: UFS storage, display, touch over SPI, GPU, USB.</p></div></li>
+      <li><div><h3>iOS root</h3><p>The iPhone X's iOS 16.7.16 system on an HFS+ volume in the userdata partition.</p></div></li>
+      <li><div><h3>Home screen</h3><p>launchd, backboardd and SpringBoard come up, drawing through Mesa on the Adreno 610.</p></div></li>
+    </ol>
+  </div>
+</section>
+
+<section class="band band--deep" id="credits">
+  <div class="inner two">
+    <div>
+      <p class="chapter">04 · Credits</p>
+      <h2 class="h2">Built on others' work.</h2>
+      <p class="lede">ios-rain is a fork. The hard groundwork was done by the projects below; this repository adds what the Redmi 10C needs.</p>
+    </div>
+    <div>
+      <div class="cards">
+        <div class="card"><span class="tag">Parent</span><h3><a href="https://github.com/MakrSas/ios-topaz">MakrSas/ios-topaz</a></h3><p>The same idea on the Redmi Note 12 4G, which shares the chip. Boot shim, display, GPU and Wi-Fi drivers.</p></div>
+        <div class="card"><span class="tag">Origin</span><h3><a href="https://github.com/dipa-studio/ios-sweet">dipa-studio/ios-sweet</a></h3><p>XNU with the iPhone X userland on a Redmi Note 10 Pro, where it all started.</p></div>
+        <div class="card"><span class="tag">GPU and audio</span><h3><a href="https://github.com/oosexgang/hakios-xnu-kernel">HakiOS</a></h3><p>Much of the GPU, display and audio glue began here.</p></div>
+      </div>
+      <p class="warn">Experimental. Installing it erases Android's user data, and iOS itself is Apple's and is not distributed here. Licences are listed in the repository's CREDITS.md.</p>
+    </div>
+  </div>
+</section>
+
+<footer class="band footer">
+  <div class="inner">
+    <div>
+      <span class="wm" data-eyes aria-label="tay.märz">tay<span class="d">.</span>m<span class="a">a<span class="eye l"><span class="pupil"><span class="glint"></span></span></span><span class="eye r"><span class="pupil"><span class="glint"></span></span></span></span>rz</span>
+      <nav aria-label="Links"><a href="https://taymaerz.de">taymaerz.de</a><a href="https://github.com/taynotfound/ios-rain">github.com/taynotfound/ios-rain</a></nav>
+    </div>
+    <p>ios-rain · a hobby port by Tay März</p>
+  </div>
+</footer>
+
+<script>
+/* the wordmark's eyes follow the pointer */
+(() => {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const pupils = [...document.querySelectorAll('[data-eyes] .pupil')];
+  addEventListener('pointermove', e => {
+    for (const p of pupils) {
+      const r = p.parentElement.getBoundingClientRect();
+      const dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+      const d = Math.hypot(dx, dy) || 1, m = r.width * 0.14;
+      p.style.setProperty('--px', (dx / d * m) + 'px');
+      p.style.setProperty('--py', (dy / d * m) + 'px');
+    }
+  }, { passive: true });
+})();
+</script>
+</body>
+</html>

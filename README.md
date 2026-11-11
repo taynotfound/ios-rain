@@ -87,6 +87,7 @@ with `mkpayload.py --blob TouchFW=...`), built payloads and boot images.
 | `shim/` | Bare-metal boot shim: boot image v4, hand-off to a Gold core, payload loader |
 | `xnu/patches/` | XNU patch series: sweet's 0001–0079, topaz's 0080–0947, **rain's 0960+** |
 | `tools/` | `mkadt.py` (Apple Device Tree), `mkpayload.py` (kernel + ADT + boot args), root image tools |
+| `site/` | The project website (GitHub Pages, `.github/workflows/pages.yml`) |
 | `build-rain/` | Redmi 10C build and boot scripts, device trees, touch-probe working copies |
 | `PORTING-rain.md` | Redmi 10C porting log |
 | `docs/UPSTREAM-topaz.md`, `NOTES.md` | Upstream documentation (Redmi Note 12 4G, Redmi Note 10 Pro) |
