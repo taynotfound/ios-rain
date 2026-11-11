@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 12:00:00 +0100
+Subject: [PATCH] rain-0980: touch C11, NT36525B driver loop
+
+C10 most likely worked: no early panic (a failed download panics within
+seconds, on the text console), then black once iOS owned the display. So
+after the download, stay up and feed the point buffer to sweet_hid_touch
+(panel 720x1650 -> 1080x2400 through the sweetfb_fit window). Panic only
+when the bring-up fails, or with raintouchpanic=1. Fixes C10's off-by-one
+in the point buffer offset.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 471806f..480421e 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1467,29 +1467,51 @@ rain_nvt_bringup(void)
+ 		memcpy(nf.info, info, sizeof(nf.info));   /* ver, ~ver, x_num, y_num, xmax(2), ymax(2) ... */
+ 	}
+ 
+-	/* poll the point buffer for 30 s: 65 bytes at EVENT_BUF, finger i at 1 + 6 i */
+-	rn.stage = "nvt touch poll";
+-	printf("RAIN TOUCH: firmware up, touch the screen now (30 s)\n");
+-	uint8_t pd[66];
+-	for (unsigned t = 0; t < 3000; t++) {
+-		if (rain_nvt_read(NVT_EVENT_BUF, pd, 65)) {
+-			break;
++}
++
++/*
++ * C11: the driver loop. 10 fingers of 6 bytes at EVENT_BUF: id (1..10) << 3 | status
++ * (1 enter, 2 move), x[11:4], y[11:4], x[3:0] << 4 | y[3:0]. Panel pixels 720x1650.
++ * sweet_hid_touch divides by 1080x2400 and iOS is drawn into 720x1559 at y = 45
++ * (sweetfb_fit), so x * 3/2 and (y - 45) * 2400/1559.
++ */
++static void
++rain_touch_run(void)
++{
++	uint8_t pd[60];
++	unsigned errs = 0;
++	rn.stage = "nvt run";
++	printf("RAIN TOUCH: firmware %02x up, %ux%u, polling every 10 ms\n", nf.info[0],
++	    ((uint32_t)nf.info[4] << 8) | nf.info[5], ((uint32_t)nf.info[6] << 8) | nf.info[7]);
++	for (;;) {
++		int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
++		uint32_t mask = 0;
++		if (rain_nvt_read(NVT_EVENT_BUF, pd, sizeof(pd))) {
++			if (++errs == 10) {
++				touch_report(0, st.x, st.y);    /* release after persistent bad reads */
++			}
++			if (errs > 1000) {
++				printf("RAIN TOUCH: giving up after %u read errors\n", errs);
++				return;
++			}
++			touch_wait(10);
++			continue;
+ 		}
+-		nf.polls++;
+-		const uint8_t *f = pd + 1;
+-		uint32_t id = f[0] >> 3, st = f[0] & 7u;
+-		if (id >= 1 && id <= 10 && (st == 1 || st == 2)) {
+-			uint32_t x = ((uint32_t)f[1] << 4) | (f[3] >> 4);
+-			uint32_t y = ((uint32_t)f[2] << 4) | (f[3] & 0x0fu);
+-			if (!nf.downs) {
+-				nf.fx = x;
+-				nf.fy = y;
+-				memcpy(nf.raw, pd, sizeof(nf.raw));
++		errs = 0;
++		for (unsigned i = 0; i < TOUCH_MAX; i++) {
++			const uint8_t *f = pd + 6u * i;
++			unsigned id = f[0] >> 3, status = f[0] & 7u;
++			unsigned px = ((unsigned)f[1] << 4) | (f[3] >> 4);
++			unsigned py = ((unsigned)f[2] << 4) | (f[3] & 0x0fu);
++			if (id < 1 || id > TOUCH_MAX || (status != 1 && status != 2) || px > 719 || py > 1649) {
++				continue;
+ 			}
+-			nf.lx = x;
+-			nf.ly = y;
+-			nf.downs++;
++			unsigned ly = py < 45 ? 0 : (py - 45u) * 2400u / 1559u;
++			x[id - 1] = (int)(px * 3u / 2u);
++			y[id - 1] = (int)(ly > 2399 ? 2399 : ly);
++			mask |= 1u << (id - 1);
+ 		}
++		touch_report(mask, x, y);
+ 		touch_wait(10);
+ 	}
+ }
+@@ -1692,7 +1714,7 @@ rain_touch_report(void)
+ 		rain_reboot_fastboot();
+ 	}
+ 	rain_smmu_cbscan();
+-	panic("RAIN TOUCH C10: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C11: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+ 	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x | FW pa=%#x len=%#x parts=%u try=%u wrote=%#x err=%d rst %02x %02x crcflag=%#x rilm=%#x rdlm=%#x | INFO %02x %02x x%u y%u max %u %u | TOUCH polls=%u downs=%u first %u,%u last %u,%u raw %02x %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+@@ -1727,8 +1749,14 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+ 	if (rain_touch_on) {
++		uint32_t stop = 0;
++		(void)PE_parse_boot_argn("raintouchpanic", &stop, sizeof(stop));
+ 		rain_touch_probe();
+-		rain_touch_report();    /* panics with every reading */
++		if (rn.err || !nf.wrote || stop) {
++			rain_touch_report();    /* panics with every reading */
++		}
++		rain_touch_run();
++		goto out;
+ 	}
+ 	st.stage = "map";
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE2\n");
