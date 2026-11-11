@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 00:10:00 +0100
+Subject: [PATCH] rain-1002: SH366101 register map from the dump
+
+The dump at 17 % (remaining 837 of 4760 mAh) gives the map: 0x1c state
+of charge, 0x04 mV (3737), 0x10 mA signed (-307 on a PC port), 0x02
+temperature in 0.1 K (3060), 0x3c design capacity (5000). The dump is
+off again.
+---
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index b919b6c..767ea8c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -472,8 +472,9 @@ rain_gauge(unsigned *percent, unsigned *mv, int *ma, int *tenthsC)
+ {
+ 	uint8_t w[2];
+ 	uint16_t v[4];
+-	static const uint8_t regs[4] = { 0x2c, 0x08, 0x0c, 0x06 };
+-	static bool dumped;
++	/* rain's SH366101 map, from a register dump at 17 %: 0x1c soc, 0x04 mV, 0x10 mA, 0x02 0.1 K (0x3c design 5000 mAh) */
++	static const uint8_t regs[4] = { 0x1c, 0x04, 0x10, 0x02 };
++	static bool dumped = true;      /* (set false to dump 0x00-0x7f once) */
+ 	if (!dumped) {
+ 		/* the TI layout gave nonsense (soc 0x128b, 0x00a0 mV): one dump of 0x00-0x7f to find the real one */
+ 		dumped = true;
