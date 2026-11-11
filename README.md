@@ -41,11 +41,12 @@ values in the shim and `tools/mkadt.py`, `build-rain/`, and the porting log
 | Memory | 2 GiB for the kernel (the `0xC0000000` bank, `build-rain/rain-ios-2g.adt`); `0x90000000`–`0xC0000000` is the GPU's pool (0985) |
 | Storage | Works. UFS at `0x4804000`; the iOS root is an HFS+ volume in `userdata` |
 | iOS userland | Works. iPhone X 16.7.16 (20H392) root; lock screen, home screen, Settings. A fresh first boot sits on the Apple logo for 15+ minutes |
-| Display | Works with `sweetfb_noshadow=1 sweetfb_fit=2`: the 1125×2436 iPhone X canvas is stretched to the whole 720×1650 panel, 5.8 % taller than its true shape (0992, not yet tested; `sweetfb_fit=1` keeps its shape with 45-pixel bars above and below). The CPU does that scaling: ~66 ms a frame, the main reason it is slow. Next: the display controller's own scaler (`qseedv3lite`) |
+| Display | Works with `sweetfb_noshadow=1 sweetfb_fit=2`: the 1125×2436 iPhone X canvas is stretched to the whole 720×1650 panel, 5.8 % taller than its true shape (0992, not yet tested; `sweetfb_fit=1` keeps its shape with 45-pixel bars above and below). The CPU does that scaling: ~66 ms a frame, the main reason it is slow. The display controller's own scaler (`qseedv3lite`) can do it instead: `sweetfb_hwscale=1` (0994, not yet tested) |
 | GPU | Works (`gpu=1 gpu_mhz=600`): Adreno 610 through Mesa freedreno (user space built by `.github/workflows/userland.yml`, installed with `build-rain/install-gpu-root.sh`) |
 | Touch | Works (patches 0962–0984), also after locking and unlocking. Novatek NT36525B over SPI through GPI DMA; the driver uploads Xiaomi's firmware at boot and again whenever the panel wakes |
 | Keys | Volume and lock keys work. Volume up + down for 3 s reboots into fastboot (0989, not yet tested) |
 | Live log | Works: `sweetusb=2` makes the phone a USB network device that streams the kernel log (0988, see below) |
+| Charging | Plugged-in and charging state from the SMB1351 charger (0993, not yet tested) |
 | Battery | Not yet: the gauge is not where it is on the Note 12, so iOS shows a fixed 100 %. 0989/0991 look for it on both I2C buses (not yet tested). Charging works on the charger chip's own defaults |
 | Vibration | Driver written (0991, GPIO 36), not yet tested |
 | Audio | Not yet. Speaker amp (AW87390) driver and firmware lookup are written (0990); the audio DSP runs Qualcomm's older APR protocol, which needs its own driver |

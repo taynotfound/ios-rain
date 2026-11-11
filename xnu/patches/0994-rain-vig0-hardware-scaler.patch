@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 00:10:00 +0100
+Subject: [PATCH] rain-0994: VIG0's QSEED3-lite scaler fits iOS to the panel
+
+The CPU fit took ~66 ms a frame (15 fps). With sweetfb_hwscale=1 a full
+1125x2436 GPU-pool frame is scanned whole and scaled by VIG0's own scaler
+(DT qcom,sde-qseed-type = "qseedv3lite" at VIG + 0xa00) into fWidth x fFitH
+at fFitTop: SSPP src/out sizes, pixel extension, phase steps in 1/2^21,
+preload 4/3, bilinear, no LUT (Linux dpu_hw_setup_scaler3, dpu_plane.c).
+Every other path restores the boot sizes and turns the scaler off.
+Untested on hardware; off by default.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9acd2c7..5a35a1b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -194,6 +194,10 @@ public:
+ 	uint32_t      fPanelUS;       /* a panel frame, measured */
+ 	uint32_t      vsyncNext(void);
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
++	/* rain: VIG0's own scaler (qseedv3lite) fits the iOS canvas to the panel (sweetfb_hwscale=1) */
++	bool          fHwScale, fScaled;
++	uint32_t      fScaledW, fScaledH;
++	uint32_t      fBootSrcSize, fBootSrcXY, fBootOutSize, fBootOutXY;
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
+@@ -213,6 +217,8 @@ public:
+ 	void          showPending(const uint8_t *rec, SweetSurface **held);
+ 	bool          directEligible(const uint8_t *rec, SweetSurface **held);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
++	void          scanRaw(uint64_t pa, uint32_t stride);
++	void          scanScaled(uint64_t pa, uint32_t stride, uint32_t w, uint32_t h);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -428,6 +434,18 @@ AppleCLCD::start(IOService *provider)
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
++		fBootSrcSize = fVig0[0x00 / 4];
++		fBootSrcXY = fVig0[0x08 / 4];
++		fBootOutSize = fVig0[0x0c / 4];
++		fBootOutXY = fVig0[0x10 / 4];
++		{
++			uint32_t hw = 0;
++			PE_parse_boot_argn("sweetfb_hwscale", &hw, sizeof(hw));
++			fHwScale = hw != 0 && fFit;
++			IOLog("RAIN FB: VIG0 src %#x at %#x, out %#x at %#x, scaler v%#x op %#x; hardware scaling %s\n",
++			    fBootSrcSize, fBootSrcXY, fBootOutSize, fBootOutXY, fVig0[0xa00 / 4], fVig0[0xa04 / 4],
++			    fHwScale ? "on" : "off");
++		}
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+@@ -965,8 +983,71 @@ AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
+ 	}
+ }
+ 
++/* back to a panel-sized source, scaler off (console, flip buffers, CPU-scaled frames) */
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++{
++	if (fScaled) {
++		fVig0[0xa04 / 4] = 0;                   /* QSEED3_OP_MODE: scaler off */
++		fVig0[0x00 / 4] = fBootSrcSize;
++		fVig0[0x08 / 4] = fBootSrcXY;
++		fVig0[0x0c / 4] = fBootOutSize;
++		fVig0[0x10 / 4] = fBootOutXY;
++		for (uint32_t o = 0x100; o <= 0x120; o += 0x10) {   /* pixel extension C0, C1C2, C3 */
++			fVig0[(o + 0x8) / 4] = fBootSrcSize;
++		}
++		fScaled = false;
++	}
++	scanRaw(pa, stride);
++}
++
++/*
++ * rain: scan a whole w x h surface and let VIG0's QSEED3-lite scaler fit it into fWidth x fFitH at
++ * fFitTop (register use after Linux dpu_hw_util.c dpu_hw_setup_scaler3 / dpu_plane.c: bilinear,
++ * phase steps in 1/2^21, default preload 4/3, no LUT, pixel extension = the source size).
++ * The CPU copies nothing.
++ */
++void
++AppleCLCD::scanScaled(uint64_t pa, uint32_t stride, uint32_t w, uint32_t h)
++{
++	if (!fScaled || w != fScaledW || h != fScaledH) {
++		volatile uint32_t *sc = fVig0 + 0xa00 / 4;
++		uint32_t stepX = (uint32_t)(((uint64_t)w << 21) / fWidth);
++		uint32_t stepY = (uint32_t)(((uint64_t)h << 21) / fFitH);
++		fVig0[0x00 / 4] = (h << 16) | w;        /* SSPP_SRC_SIZE */
++		fVig0[0x08 / 4] = 0;                    /* SSPP_SRC_XY */
++		fVig0[0x0c / 4] = (fFitH << 16) | fWidth;       /* SSPP_OUT_SIZE */
++		fVig0[0x10 / 4] = fFitTop << 16;        /* SSPP_OUT_XY */
++		for (uint32_t o = 0x100; o <= 0x120; o += 0x10) {
++			fVig0[o / 4] = 0;               /* LR */
++			fVig0[(o + 0x4) / 4] = 0;       /* TB */
++			fVig0[(o + 0x8) / 4] = (h << 16) | w;   /* REQ_PIXELS */
++		}
++		sc[0x90 / 4] = 0;                       /* PHASE_INIT_Y_H, _Y_V, _UV_H, _UV_V */
++		sc[0x94 / 4] = 0;
++		sc[0x98 / 4] = 0;
++		sc[0x9c / 4] = 0;
++		sc[0x10 / 4] = stepX;                   /* PHASE_STEP_Y_H */
++		sc[0x14 / 4] = stepY;                   /* PHASE_STEP_Y_V */
++		sc[0x18 / 4] = stepX;                   /* PHASE_STEP_UV_H */
++		sc[0x1c / 4] = stepY;                   /* PHASE_STEP_UV_V */
++		sc[0x20 / 4] = 4u | (3u << 8) | (4u << 16) | (3u << 24);   /* PRELOAD */
++		sc[0x40 / 4] = w | (h << 16);           /* SRC_SIZE_Y_RGB_A */
++		sc[0x44 / 4] = w | (h << 16);           /* SRC_SIZE_UV */
++		sc[0x48 / 4] = fWidth | (fFitH << 16);  /* DST_SIZE */
++		/* enable, bilinear Y/RGB (3 << 16), not 10-bit (bit 14), blend (bit 31) */
++		sc[0x04 / 4] = 1u | (3u << 16) | (1u << 14) | (1u << 31);
++		fScaled = true;
++		fScaledW = w;
++		fScaledH = h;
++		IOLog("RAIN FB: hardware scaling %ux%u -> %ux%u at y %u (steps %#x %#x)\n", w, h, fWidth, fFitH, fFitTop,
++		    stepX, stepY);
++	}
++	scanRaw(pa, stride);
++}
++
++void
++AppleCLCD::scanRaw(uint64_t pa, uint32_t stride)
+ {
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+@@ -1386,6 +1467,18 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	}
+ 	bool ok = false;
+ 	(void)topaz_surface_drawn(s, 100);
++	if (fHwScale && s->gpuPool && s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
++	    s->width == fLogicalW && s->height == fLogicalH && (s->bytesPerRow & 0xf) == 0) {
++		uint64_t pa = s->scanoutPhys + s->offset;
++		if ((pa & 0xf) == 0 && pa + (uint64_t)s->height * s->bytesPerRow < (1ull << 32)) {
++			scanScaled(pa, s->bytesPerRow, s->width, s->height);
++			IOLockLock(fLock);
++			fLastVA = NULL;
++			IOLockUnlock(fLock);
++			s->release();
++			return true;
++		}
++	}
+ 	if (fFit && fFlip[0] != NULL && s->bytesPerElement == 4 && s->elementWidth == 1 &&
+ 	    s->width == fLogicalW && s->height == fLogicalH && s->memory != NULL &&
+ 	    (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow <= s->memory->getLength()) {
