@@ -1,0 +1,342 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 22:10:00 +0100
+Subject: [PATCH] rain-0990: AW87390 speaker amp; modem-partition files by FAT name
+
+rain's speaker amp is an Awinic AW87390 at 0x58 on QUP0 SE1 (DT), not
+topaz's sia8159: chip id check (0x76), then profile 0 ("Music") of the
+stock aw87xxx_acf.bin, off = SYSCTRL 0. Firmware files on the modem
+partition are looked up by name in its FAT (FAT16/32, 8.3 names) before
+topaz's offset table, which was measured on the Redmi Note 12's
+NON-HLOS.bin. Host-tested on FAT16 and FAT32 images.
+Note: rain's ADSP runs the APR/Elite stack (DT qcom,msm-audio-apr), not
+AudioReach: TopazAudio's GPR graph will not come up as it is.
+---
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 6bfe1a2..cbea497 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1214,6 +1214,7 @@ extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32
+ extern "C" bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
+ extern "C" int  sweet_i2c1_init(void);
+ extern "C" int  sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++extern "C" int  sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ static uint32_t call_token, call_op, call_words, call_rsp[16];
+@@ -1304,7 +1305,7 @@ prm(const uint32_t *dw, uint32_t n)
+ 	return true;
+ }
+ 
+-/* ---------------------------------------------------------------- codec (WCD937x AUX + sia8159) */
++/* ---------------------------------------------------------------- codec (WCD937x AUX + AW87390 on rain) */
+ 
+ #define LPASS_PA            0x0A600000ull       /* RX/TX/VA macros, SoundWire masters, LPI TLMM, CGCRs */
+ #define LPASS_SIZE          0x00360000u
+@@ -1315,7 +1316,7 @@ prm(const uint32_t *dw, uint32_t n)
+ #define VA_SWR              0x0A740000u
+ #define LPI_TLMM            0x0A7C0000u
+ #define TLMM_GPIO92_PA      0x0055C000ull       /* WCD937x reset, TLMM WEST */
+-#define AMP_I2C             0x2b                /* sia8159 on QUP0 SE1 */
++#define AMP_I2C             0x58                /* rain: AW87390 on QUP0 SE1 (DT aw87xxx_pa_58@58; topaz: sia8159 0x2b) */
+ 
+ static volatile uint8_t *lpass, *gpio92;
+ static uint32_t swr_id;
+@@ -1497,23 +1498,44 @@ ports_and_pa(void)
+ 	LOG("t=%u.%03u ports: rx frame b1 %08x, irq %08x", T, lr(RX_SWR + 0x105C), lr(RX_SWR + 0x200));
+ }
+ 
++/*
++ * rain: the speaker amp is an Awinic AW87390 (chip id 0x76 at register 0). Its settings are
++ * profile 0 ("Music" in Awinic's aw87xxx profile enum) of the stock /vendor/firmware/aw87xxx_acf.bin:
++ * register/value pairs, the last one (0x01 = 0x07) switches it on. Off: SYSCTRL (0x01) = 0
++ * (Linux aw87390.c). Byte pairs at register 0xfe/0xff are delays/terminators there: skipped.
++ */
+ static void
+ amp_on(bool on)
+ {
+-	static const uint8_t regs[][2] = { { 1, 0x7c }, { 2, 0x21 }, { 5, 0x01 }, { 3, 0x30 }, { 4, 0xc5 },
+-		                           { 6, 0x48 }, { 7, 0x5d }, { 8, 0x8a }, { 9, 0x0e }, { 10, 0xa4 } };
++	static const uint8_t music[][2] = {
++		{ 0x67, 0x23 }, { 0x02, 0x07 }, { 0x02, 0x00 }, { 0x02, 0x1c }, { 0x03, 0x08 }, { 0x04, 0x05 },
++		{ 0x05, 0x0a }, { 0x06, 0x0e }, { 0x07, 0x4e }, { 0x08, 0x09 }, { 0x09, 0x08 }, { 0x0a, 0x4b },
++		{ 0x61, 0xb3 }, { 0x62, 0x24 }, { 0x63, 0x09 }, { 0x64, 0x24 }, { 0x65, 0x15 }, { 0x79, 0x7a },
++		{ 0x7a, 0x6c }, { 0x78, 0x80 }, { 0x66, 0x30 }, { 0x78, 0x00 }, { 0x68, 0x1b }, { 0x69, 0x5b },
++		{ 0x70, 0x1c }, { 0x71, 0x00 }, { 0x72, 0xfe }, { 0x73, 0x4f }, { 0x74, 0x24 }, { 0x75, 0x02 },
++		{ 0x01, 0x07 },
++	};
+ 	int err = 0;
+-
+-	if (on && !amp_init) {
+-		err = sweet_i2c1_init();
+-		for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]) && err == 0; i++) {
+-			err = sweet_i2c1_write(AMP_I2C, regs[i][0], regs[i][1]);
++	uint8_t id = 0;
++
++	if (on) {
++		err = amp_init ? 0 : sweet_i2c1_init();
++		if (err == 0 && !amp_init) {
++			err = sweet_i2c1_read(AMP_I2C, 0x00, &id, 1);
++			if (err == 0 && id != 0x76) {
++				LOG("t=%u.%03u amp: chip id %#x is not an AW87390: left alone", T, id);
++				return;
++			}
++			amp_init = err == 0;
+ 		}
+-		amp_init = err == 0;
+-	} else {
+-		err = sweet_i2c1_write(AMP_I2C, 5, on ? 1 : 0);
++		err = err ? err : sweet_i2c1_write(AMP_I2C, 0x01, 0x00);          /* power down, then the profile */
++		for (uint32_t i = 0; i < sizeof(music) / sizeof(music[0]) && err == 0; i++) {
++			err = sweet_i2c1_write(AMP_I2C, music[i][0], music[i][1]);
++		}
++	} else if (amp_init) {
++		err = sweet_i2c1_write(AMP_I2C, 0x01, 0x00);
+ 	}
+-	LOG("t=%u.%03u amp %s: %d", T, on ? "on" : "off", err);
++	LOG("t=%u.%03u amp %s: %d (id %#x)", T, on ? "on" : "off", err, id);
+ }
+ 
+ /* ---------------------------------------------------------------- AudioReach graph */
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 8aa0c2f..15dcc41 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6340,9 +6340,226 @@ topaz_pool_alloc(uint64_t size, uint64_t *pa)
+ }
+ 
+ /* a file of the modem partition by its path ("image/adsp.mdt"): size, or -1 */
++static int
++fat_rd(uint64_t off, void *dst, uint64_t len)
++{
++	return sweet_ufs_read_part(fw_part, off, dst, len);
++}
++
++static void *
++fat_alloc(uint32_t n)
++{
++	return IOMalloc(n);
++}
++
++static void
++fat_free(void *p, uint32_t n)
++{
++	IOFree(p, n);
++}
++
++/*
++ * rain: firmware files found by name in the modem partition's FAT (FAT16 or FAT32, 8.3 names),
++ * instead of topaz's table of offsets measured on the Redmi Note 12's NON-HLOS.bin.
++ * fat_rd(off, dst, len) reads the partition; fat_alloc/fat_free hold the FAT itself.
++ * shortcut: 8.3 names only (no long names); enough for image/adsp.*, extend for wlanmdsp.mbn etc.
++ */
++static struct {
++	bool tried, ok, fat32;
++	uint32_t bps, spc, clus;            /* bytes a sector, sectors a cluster, bytes a cluster */
++	uint64_t fat_off, root_off, data_off;
++	uint32_t root_ents, root_clus, nclus;
++	uint8_t *fat;
++	uint32_t fat_len;
++} fs;
++
++static uint32_t fat_le16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
++static uint32_t fat_le32(const uint8_t *p) { return fat_le16(p) | (fat_le16(p + 2) << 16); }
++
++static bool
++fat_mount(void)
++{
++	uint8_t bs[512];
++	if (fs.tried) {
++		return fs.ok;
++	}
++	fs.tried = true;
++	if (fat_rd(0, bs, sizeof(bs)) != 0 || bs[510] != 0x55 || bs[511] != 0xaa) {
++		return false;
++	}
++	fs.bps = fat_le16(bs + 11);
++	fs.spc = bs[13];
++	uint32_t rsv = fat_le16(bs + 14), nfats = bs[16], fatsz = fat_le16(bs + 22);
++	uint32_t tot = fat_le16(bs + 19) ? fat_le16(bs + 19) : fat_le32(bs + 32);
++	fs.root_ents = fat_le16(bs + 17);
++	if (fs.bps < 512 || fs.bps > 4096 || (fs.bps & (fs.bps - 1)) || fs.spc == 0 || nfats == 0) {
++		return false;
++	}
++	fs.fat32 = fatsz == 0;
++	if (fs.fat32) {
++		fatsz = fat_le32(bs + 36);
++		fs.root_clus = fat_le32(bs + 44);
++	}
++	fs.clus = fs.bps * fs.spc;
++	fs.fat_off = (uint64_t)rsv * fs.bps;
++	fs.root_off = fs.fat_off + (uint64_t)nfats * fatsz * fs.bps;
++	fs.data_off = fs.root_off + (uint64_t)((fs.root_ents * 32 + fs.bps - 1) / fs.bps) * fs.bps;
++	fs.nclus = (uint32_t)((tot - fs.data_off / fs.bps) / fs.spc) + 2;
++	fs.fat_len = fatsz * fs.bps;
++	if (fs.fat_len == 0 || fs.fat_len > (16u << 20) || (fs.fat = (uint8_t *)fat_alloc(fs.fat_len)) == NULL) {
++		return false;
++	}
++	if (fat_rd(fs.fat_off, fs.fat, fs.fat_len) != 0) {
++		fat_free(fs.fat, fs.fat_len);
++		fs.fat = NULL;
++		return false;
++	}
++	fs.ok = true;
++	return true;
++}
++
++static uint32_t
++fat_next(uint32_t c)
++{
++	if (fs.fat32) {
++		return (uint64_t)c * 4 + 4 <= fs.fat_len ? fat_le32(fs.fat + c * 4) & 0x0fffffffu : 0x0fffffffu;
++	}
++	uint32_t v = (uint64_t)c * 2 + 2 <= fs.fat_len ? fat_le16(fs.fat + c * 2) : 0xffffu;
++	return v >= 0xfff8u ? 0x0fffffffu : v;
++}
++
++static bool
++fat_clus_ok(uint32_t c)
++{
++	return c >= 2 && c < fs.nclus;
++}
++
++/* "adsp.b00" -> "ADSP    B00"; false if it is no 8.3 name */
++static bool
++fat_83(const char *s, size_t n, uint8_t out[11])
++{
++	memset(out, ' ', 11);
++	size_t i = 0, j = 0;
++	for (; i < n && s[i] != '.'; i++) {
++		if (j >= 8) {
++			return false;
++		}
++		out[j++] = (uint8_t)((s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i]);
++	}
++	if (i < n) {
++		for (i++, j = 8; i < n; i++) {
++			if (j >= 11 || s[i] == '.') {
++				return false;
++			}
++			out[j++] = (uint8_t)((s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i]);
++		}
++	}
++	return n > 0;
++}
++
++/* look name up in a directory (dir_clus 0: the FAT16 root) */
++static bool
++fat_dir_find(uint32_t dir_clus, const uint8_t want[11], uint32_t *clus, uint32_t *size, bool *isdir)
++{
++	uint8_t e[32];
++	bool root16 = dir_clus == 0 && !fs.fat32;
++	uint32_t c = dir_clus == 0 && fs.fat32 ? fs.root_clus : dir_clus;
++	for (uint32_t guard = 0; guard < 65536; guard++) {
++		uint64_t base, len;
++		if (root16) {
++			base = fs.root_off;
++			len = (uint64_t)fs.root_ents * 32;
++		} else {
++			if (!fat_clus_ok(c)) {
++				return false;
++			}
++			base = fs.data_off + (uint64_t)(c - 2) * fs.clus;
++			len = fs.clus;
++		}
++		for (uint64_t o = 0; o < len; o += 32) {
++			if (fat_rd(base + o, e, 32) != 0 || e[0] == 0) {
++				return false;               /* end of directory */
++			}
++			if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x08)) {
++				continue;                   /* deleted, long-name part, volume label */
++			}
++			if (memcmp(e, want, 11) == 0) {
++				*clus = fat_le16(e + 26) | (fs.fat32 ? fat_le16(e + 20) << 16 : 0);
++				*size = fat_le32(e + 28);
++				*isdir = (e[11] & 0x10) != 0;
++				return true;
++			}
++		}
++		if (root16) {
++			return false;
++		}
++		c = fat_next(c);
++	}
++	return false;
++}
++
++/* "image/adsp.b00" -> first cluster and size of that file */
++static bool
++fat_lookup(const char *path, uint32_t *clus, uint32_t *size)
++{
++	uint32_t dir = 0;
++	bool isdir = true;
++	if (!fat_mount()) {
++		return false;
++	}
++	for (const char *p = path; *p;) {
++		const char *s = p;
++		while (*p && *p != '/') {
++			p++;
++		}
++		uint8_t want[11];
++		if (!isdir || !fat_83(s, (size_t)(p - s), want) || !fat_dir_find(dir, want, clus, size, &isdir)) {
++			return false;
++		}
++		dir = *clus;
++		if (*p == '/') {
++			p++;
++		}
++	}
++	return !isdir;
++}
++
++/* read n bytes at off of the file starting at cluster first (size bytes long) */
++static bool
++fat_read_file(uint32_t first, uint32_t size, uint64_t off, void *dst, uint64_t n)
++{
++	if (off + n > size) {
++		return false;
++	}
++	uint32_t c = first;
++	uint64_t pos = 0, done = 0;
++	for (uint32_t guard = 0; done < n && guard < fs.nclus; guard++) {
++		if (!fat_clus_ok(c)) {
++			return false;
++		}
++		if (off + done < pos + fs.clus) {
++			uint64_t in = off + done - pos, take = fs.clus - in;
++			if (take > n - done) {
++				take = n - done;
++			}
++			if (fat_rd(fs.data_off + (uint64_t)(c - 2) * fs.clus + in, (uint8_t *)dst + done, take) != 0) {
++				return false;
++			}
++			done += take;
++		}
++		pos += fs.clus;
++		c = fat_next(c);
++	}
++	return done == n;
++}
++
+ extern "C" int64_t
+ topaz_part_fw_size(const char *path)
+ {
++	uint32_t clus, size;
++	if (fat_lookup(path, &clus, &size)) {
++		return size;
++	}
+ 	int i = fw_all_find(path);
+ 	return i < 0 ? -1 : (int64_t)fw_all[i].size;
+ }
+@@ -6350,6 +6567,10 @@ topaz_part_fw_size(const char *path)
+ extern "C" bool
+ topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n)
+ {
++	uint32_t clus, size;
++	if (fat_lookup(path, &clus, &size)) {
++		return fat_read_file(clus, size, off, dst, n);
++	}
+ 	int i = fw_all_find(path);
+ 	return i >= 0 && off + n <= fw_all[i].size && fw_all_read(i, off, dst, n);
+ }
