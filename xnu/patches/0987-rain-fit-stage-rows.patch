@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 20:30:00 +0100
+Subject: [PATCH] rain-0987: fit scaling reads each source row once, with wide loads
+
+With gpu=1 the frame iOS presents lives in the GPU pool (write-combined,
+uncached). sweet_fit_blit read it pixel by pixel, up to four 4-byte reads per
+panel pixel, each its own bus transaction: the frame rate was very low. Copy
+every source row once into a cached row (memcpy) and scale from there.
+Output is bit-identical (host test against the old function).
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5cc8898..fd77b7d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1278,6 +1278,8 @@ sweet_fit_lerp(uint32_t a, uint32_t b, uint32_t f)
+ 	return (rb & 0x00ff00ffu) | ((ag & 0x00ff00ffu) << 8);
+ }
+ 
++#define SWEET_FIT_ROW_MAX 2048         /* source row pixels the staging rows hold */
++
+ static void
+ sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH, uint32_t top,
+     uint32_t logicalW, const uint8_t *src, uint32_t stride, int32_t sx, int32_t sy,
+@@ -1315,6 +1317,15 @@ sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH,
+ 		xs[px] = (int32_t)(u >> 8);
+ 		xf[px] = (uint16_t)(xs[px] + 1 < lw ? (u & 255) : 0);
+ 	}
++	/*
++	 * The source is usually a GPU surface in write-combined (uncached) memory, where every
++	 * 4-byte read is its own bus transaction: about 4.5 M of them a frame made the GPU
++	 * slower than the CPU. Each source row is copied once, with memcpy's wide loads, into
++	 * a cached row (two in flight: y0 and y0 + 1 never share a slot), and scaled from there.
++	 */
++	static uint32_t rows[2][SWEET_FIT_ROW_MAX];     /* shortcut: one presenter at a time (frames are queued); per-thread rows if that changes */
++	int32_t row_tag[2] = { -1, -1 };
++	bool stage = lw <= SWEET_FIT_ROW_MAX;
+ 	for (int64_t py = py0; py < py1; py++) {
+ 		int64_t v = ((2 * py + 1) * (int64_t)logicalW * 128) / panelW - 128 - (int64_t)ly * 256;
+ 		if (v < 0) {
+@@ -1327,6 +1338,17 @@ sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH,
+ 		uint32_t fy = y0 + 1 < lh ? (uint32_t)(v & 255) : 0;
+ 		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + y0) * stride) + sx;
+ 		const uint32_t *r1 = fy ? (const uint32_t *)((const uint8_t *)r0 + stride) : r0;
++		if (stage) {
++			for (int32_t k = 0; k < (fy ? 2 : 1); k++) {
++				int32_t y = y0 + k, slot = y & 1;
++				if (row_tag[slot] != y) {
++					memcpy(rows[slot], (const uint8_t *)r0 + (uint64_t)k * stride, (size_t)lw * 4);
++					row_tag[slot] = y;
++				}
++			}
++			r0 = rows[y0 & 1];
++			r1 = fy ? rows[(y0 + 1) & 1] : r0;
++		}
+ 		uint32_t *out = (uint32_t *)(dst + (uint64_t)(top + py) * dstStride);
+ 		for (int64_t px = px0; px < px1; px++) {
+ 			int32_t x = xs[px];
