@@ -1,22 +1,38 @@
-# GPU user space for the iOS root: Mesa (freedreno) as libOSMesa, built with Xcode's iOS SDK.
+# GPU user space for the iOS root: Mesa (freedreno) as libOSMesa plus the EAGL library and its loader,
+# built with Xcode's iOS SDK.
 # Upstream builds this on a private Mac (userland/mesa/mk-mesa-mac.sh); here it runs on a hosted runner.
 name: userland
 on:
   workflow_dispatch:
 jobs:
-  mesa:
+  gpu:
     runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Tools
-        run: brew install meson ninja bison
+      - name: Mesa cache
+        id: mesa
+        uses: actions/cache/restore@v4
+        with:
+          path: userland/build-mesa/out
+          key: mesa-ios-${{ hashFiles('userland/mesa/**') }}
       - name: Build Mesa
+        if: steps.mesa.outputs.cache-hit != 'true'
         run: |
+          brew install meson ninja bison
           # the script expects to sit next to mesa/ and to find build-mesa/ there
           cp userland/mesa/mk-mesa-mac.sh userland/mk-mesa-mac.sh
           mkdir -p userland/build-mesa
           bash userland/mk-mesa-mac.sh
+      # saved here, not at the end of the job: a failing GL build must not cost another Mesa build
+      - name: Save Mesa
+        if: steps.mesa.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: userland/build-mesa/out
+          key: mesa-ios-${{ hashFiles('userland/mesa/**') }}
+      - name: Build the GL libraries
+        run: userland/gpu/build.sh userland/build-mesa/out userland/out-gpu
       - name: Logs on failure
         if: failure()
         run: |
@@ -26,6 +42,9 @@ jobs:
           tail -30 ninja.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
-          name: mesa-ios
-          path: userland/build-mesa/out
+          name: gpu-userland
+          path: |
+            userland/out-gpu/*.dylib
+            userland/out-gpu/backboardd
+            userland/out-gpu/eagl_gen.h
           if-no-files-found: error

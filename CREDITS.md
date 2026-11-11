@@ -10,6 +10,10 @@ The Redmi 10C work (kernel patches `0960` and up, `build-rain/`, `PORTING-rain.m
 licences of the files it changes: APSL 2.0 for the XNU patches. The Novatek touch code follows
 Xiaomi's published GPL-2.0 kernel driver (`nt36xxx`) as a hardware reference.
 
+`userland/gpu/mkeagl.py`, `userland/gpu/eagl_slots.txt` and the recipe in `userland/gpu/build.sh` come from
+HakiOS's `userland/` (<https://github.com/oosexgang/hakios-xnu-kernel>, MIT, Copyright (c) 2025-2026 the
+HakiOS authors); upstream ios-topaz built its GPU user space with a private script.
+
 ## HackiOS (OOSEX GANG)
 
 Much of the GPU, display, audio, Wi-Fi glue and sandbox work here started from **HackiOS**, which
