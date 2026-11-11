@@ -17,7 +17,7 @@ int SecureDTGetProperty(DTEntry a, const char *b, void const **c, unsigned int *
 vm_offset_t ml_io_map(vm_offset_t a, vm_size_t b) { return 0; }
 void flush_dcache64(addr64_t a, unsigned b, int c) {}
 static struct { int err; const char *stage; } rn;
-static struct { int x[TOUCH_MAX], y[TOUCH_MAX]; } st;
+static struct { int x[TOUCH_MAX], y[TOUCH_MAX]; unsigned s_down, s_up; } st;
 static int rain_spi(uint32_t op, const uint8_t *tx, uint8_t *rx, unsigned n) { return 0; }
 static int rain_nvt_write(uint32_t a, uint8_t v) { return 0; }
 /* frames: finger id 1 at panel (0,45), then id 2 at (719,1603), then nothing, then end */
@@ -32,11 +32,11 @@ static int rain_nvt_read(uint32_t a, uint8_t *o, unsigned n) {
 }
 static void touch_report(uint32_t mask, const int *x, const int *y) {
 	if (frame == 0) assert(mask == 1 && x[0] == 0 && y[0] == 0);
-	if (frame == 1) assert(mask == 2 && x[1] == 1078 && y[1] == 2398);
+	if (frame == 1) assert(mask == 2 && x[1] == 1079 && y[1] == 2399);
 	if (frame == 2) { assert(mask == 0); puts("run loop mapping OK"); exit(0); }
 	frame++;
 }
 static void touch_wait(unsigned ms) {}
 #include "blk11.inc"
 static void rain_touch_report(void) { puts("report"); exit(2); }
-int main(void) { rain_touch_run(false); return 1; }
+int main(void) { rain_touch_run(0); return 1; }

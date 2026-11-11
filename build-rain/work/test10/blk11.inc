@@ -22,6 +22,10 @@ static struct {
 	uint8_t info[12];
 	uint32_t polls, downs, fx, fy, lx, ly;
 	uint8_t raw[7];
+	/* raintouchpanic=3: 3 s of statistics from the first contact */
+	uint32_t t3_frames, t3_max, t3_ids, t3_empty;
+	uint8_t t3_first[18];             /* first frame: up to 3 valid records */
+	uint32_t t3_x0, t3_y0, t3_x1, t3_y1;   /* finger id 1: first and last panel position */
 } nf;
 
 static int
@@ -191,14 +195,14 @@ rain_nvt_bringup(void)
 /*
  * C11: the driver loop. 10 fingers of 6 bytes at EVENT_BUF: id (1..10) << 3 | status
  * (1 enter, 2 move), x[11:4], y[11:4], x[3:0] << 4 | y[3:0]. Panel pixels 720x1650.
- * sweet_hid_touch divides by 1080x2400 and iOS is drawn into 720x1559 at y = 45
- * (sweetfb_fit), so x * 3/2 and (y - 45) * 2400/1559.
+ * iOS's 1125x2436 canvas is drawn into 720x1559 at y = 45 (sweetfb_fit); sweet_hid_touch
+ * wants 1080x2400 panel pixels and adds the canvas origin (20, 18) itself (SweetHID.cpp).
  */
 static void rain_touch_report(void);
 
-/* stop_on_touch (raintouchpanic=2): panic at the first finger with its raw record */
+/* stop (raintouchpanic): 2 = panic at the first finger, 3 = panic 3 s after it with statistics */
 static void
-rain_touch_run(bool stop_on_touch)
+rain_touch_run(unsigned stop)
 {
 	uint8_t pd[60];
 	unsigned errs = 0;
@@ -221,6 +225,7 @@ rain_touch_run(bool stop_on_touch)
 		}
 		errs = 0;
 		nf.polls++;
+		unsigned nvalid = 0;
 		for (unsigned i = 0; i < TOUCH_MAX; i++) {
 			const uint8_t *f = pd + 6u * i;
 			unsigned id = f[0] >> 3, status = f[0] & 7u;
@@ -229,9 +234,23 @@ rain_touch_run(bool stop_on_touch)
 			if (id < 1 || id > TOUCH_MAX || (status != 1 && status != 2) || px > 719 || py > 1649) {
 				continue;
 			}
-			unsigned ly = py < 45 ? 0 : (py - 45u) * 2400u / 1559u;
-			x[id - 1] = (int)(px * 3u / 2u);
-			y[id - 1] = (int)(ly > 2399 ? 2399 : ly);
+			int hx = (int)(px * 1125u / 720u) - 20;
+			int hy = (py < 45 ? 0 : (int)((py - 45u) * 2436u / 1559u)) - 18;
+			x[id - 1] = hx < 0 ? 0 : (hx > 1079 ? 1079 : hx);
+			y[id - 1] = hy < 0 ? 0 : (hy > 2399 ? 2399 : hy);
+			if (!nf.t3_frames && nvalid < 3) {
+				memcpy(nf.t3_first + 6u * nvalid, f, 6);
+			}
+			nvalid++;
+			nf.t3_ids |= 1u << id;
+			if (id == 1) {
+				if (!nf.t3_frames) {
+					nf.t3_x0 = px;
+					nf.t3_y0 = py;
+				}
+				nf.t3_x1 = px;
+				nf.t3_y1 = py;
+			}
 			mask |= 1u << (id - 1);
 			if (!nf.downs++) {
 				nf.fx = px;
@@ -242,10 +261,18 @@ rain_touch_run(bool stop_on_touch)
 			nf.lx = (uint32_t)x[id - 1];
 			nf.ly = (uint32_t)y[id - 1];
 		}
-		if (stop_on_touch && mask) {
+		if (stop == 2 && mask) {
 			rain_touch_report();
 		}
+		if (nf.downs) {
+			nf.t3_frames++;
+			nf.t3_empty += !mask;
+			nf.t3_max = nvalid > nf.t3_max ? nvalid : nf.t3_max;
+		}
 		touch_report(mask, x, y);
+		if (stop == 3 && nf.t3_frames >= 300) {
+			rain_touch_report();
+		}
 		touch_wait(10);
 	}
 }
