@@ -38,4 +38,5 @@ static void touch_report(uint32_t mask, const int *x, const int *y) {
 }
 static void touch_wait(unsigned ms) {}
 #include "blk11.inc"
-int main(void) { rain_touch_run(); return 1; }
+static void rain_touch_report(void) { puts("report"); exit(2); }
+int main(void) { rain_touch_run(false); return 1; }

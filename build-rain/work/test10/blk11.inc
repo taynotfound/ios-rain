@@ -194,8 +194,11 @@ rain_nvt_bringup(void)
  * sweet_hid_touch divides by 1080x2400 and iOS is drawn into 720x1559 at y = 45
  * (sweetfb_fit), so x * 3/2 and (y - 45) * 2400/1559.
  */
+static void rain_touch_report(void);
+
+/* stop_on_touch (raintouchpanic=2): panic at the first finger with its raw record */
 static void
-rain_touch_run(void)
+rain_touch_run(bool stop_on_touch)
 {
 	uint8_t pd[60];
 	unsigned errs = 0;
@@ -217,6 +220,7 @@ rain_touch_run(void)
 			continue;
 		}
 		errs = 0;
+		nf.polls++;
 		for (unsigned i = 0; i < TOUCH_MAX; i++) {
 			const uint8_t *f = pd + 6u * i;
 			unsigned id = f[0] >> 3, status = f[0] & 7u;
@@ -229,6 +233,17 @@ rain_touch_run(void)
 			x[id - 1] = (int)(px * 3u / 2u);
 			y[id - 1] = (int)(ly > 2399 ? 2399 : ly);
 			mask |= 1u << (id - 1);
+			if (!nf.downs++) {
+				nf.fx = px;
+				nf.fy = py;
+				memcpy(nf.raw, f, 6);
+				nf.raw[6] = (uint8_t)i;
+			}
+			nf.lx = (uint32_t)x[id - 1];
+			nf.ly = (uint32_t)y[id - 1];
+		}
+		if (stop_on_touch && mask) {
+			rain_touch_report();
 		}
 		touch_report(mask, x, y);
 		touch_wait(10);

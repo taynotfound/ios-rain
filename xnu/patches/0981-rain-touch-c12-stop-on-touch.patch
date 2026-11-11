@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 18:40:00 +0100
+Subject: [PATCH] rain-0981: touch C12, raintouchpanic=2 stops at the first finger
+
+C11 with raintouchpanic=1: firmware 0x0d up (rst a0, 720x1650), yet iOS
+did not react. raintouchpanic=2 runs the driver loop and panics at the
+first finger-down with the panel and HID coordinates and the raw record.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 480421e..d988b5d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1475,8 +1475,11 @@ rain_nvt_bringup(void)
+  * sweet_hid_touch divides by 1080x2400 and iOS is drawn into 720x1559 at y = 45
+  * (sweetfb_fit), so x * 3/2 and (y - 45) * 2400/1559.
+  */
++static void rain_touch_report(void);
++
++/* stop_on_touch (raintouchpanic=2): panic at the first finger with its raw record */
+ static void
+-rain_touch_run(void)
++rain_touch_run(bool stop_on_touch)
+ {
+ 	uint8_t pd[60];
+ 	unsigned errs = 0;
+@@ -1498,6 +1501,7 @@ rain_touch_run(void)
+ 			continue;
+ 		}
+ 		errs = 0;
++		nf.polls++;
+ 		for (unsigned i = 0; i < TOUCH_MAX; i++) {
+ 			const uint8_t *f = pd + 6u * i;
+ 			unsigned id = f[0] >> 3, status = f[0] & 7u;
+@@ -1510,6 +1514,17 @@ rain_touch_run(void)
+ 			x[id - 1] = (int)(px * 3u / 2u);
+ 			y[id - 1] = (int)(ly > 2399 ? 2399 : ly);
+ 			mask |= 1u << (id - 1);
++			if (!nf.downs++) {
++				nf.fx = px;
++				nf.fy = py;
++				memcpy(nf.raw, f, 6);
++				nf.raw[6] = (uint8_t)i;
++			}
++			nf.lx = (uint32_t)x[id - 1];
++			nf.ly = (uint32_t)y[id - 1];
++		}
++		if (stop_on_touch && mask) {
++			rain_touch_report();
+ 		}
+ 		touch_report(mask, x, y);
+ 		touch_wait(10);
+@@ -1714,9 +1729,9 @@ rain_touch_report(void)
+ 		rain_reboot_fastboot();
+ 	}
+ 	rain_smmu_cbscan();
+-	panic("RAIN TOUCH C11: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C12: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+-	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x | FW pa=%#x len=%#x parts=%u try=%u wrote=%#x err=%d rst %02x %02x crcflag=%#x rilm=%#x rdlm=%#x | INFO %02x %02x x%u y%u max %u %u | TOUCH polls=%u downs=%u first %u,%u last %u,%u raw %02x %02x %02x %02x %02x %02x %02x",
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x | FW pa=%#x len=%#x parts=%u try=%u wrote=%#x err=%d rst %02x %02x crcflag=%#x rilm=%#x rdlm=%#x | INFO %02x %02x x%u y%u max %u %u | TOUCH polls=%u downs=%u panel %u,%u hid %u,%u raw %02x %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+ 	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
+ 	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+@@ -1752,10 +1767,10 @@ touch_thread(void *arg, wait_result_t result)
+ 		uint32_t stop = 0;
+ 		(void)PE_parse_boot_argn("raintouchpanic", &stop, sizeof(stop));
+ 		rain_touch_probe();
+-		if (rn.err || !nf.wrote || stop) {
++		if (rn.err || !nf.wrote || stop == 1) {
+ 			rain_touch_report();    /* panics with every reading */
+ 		}
+-		rain_touch_run();
++		rain_touch_run(stop == 2);
+ 		goto out;
+ 	}
+ 	st.stage = "map";
