@@ -20,7 +20,7 @@ for f in a610_zap.mdt a610_zap.b02 a630_sqe.fw; do
 	[ -s "$FW/$f" ] || { echo "missing $FW/$f (debugfs -R 'dump /firmware/$f ...' vendor.img)"; exit 1; }
 done
 # an unsigned wrapper makes launchd panic at boot: refuse to install one
-grep -q "$(printf '\xfa\xde\x0c\xc0')" "$G/backboardd" || { echo "$G/backboardd has no code signature"; exit 1; }
+LC_ALL=C grep -a -q -P '\xfa\xde\x0c\xc0' "$G/backboardd" || { echo "$G/backboardd has no code signature"; exit 1; }
 . build-rain/lib-fsck.sh
 fsck_clean
 
