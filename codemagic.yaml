@@ -1,0 +1,19 @@
+# Fallback kernel build on Codemagic (macOS), for when GitHub Actions is down.
+# Same steps as .github/workflows/xnu.yml, in build-rain/ci-build-xnu.sh.
+workflows:
+  xnu:
+    name: xnu kernel
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 15.4
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/.ccache
+    scripts:
+      - name: Build the kernel
+        script: XCODE_APP=$(xcode-select -p | sed "s,/Contents/Developer$,,") build-rain/ci-build-xnu.sh
+    artifacts:
+      - out/kernel.development.sweet
+      - out/SHA256SUMS
+      - buildtree.tgz

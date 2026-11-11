@@ -75,10 +75,13 @@ Details, the boot log of every test image and the touch bring-up are in
 
 The kernel is built by GitHub Actions (`.github/workflows/xnu.yml`, macOS runner), which applies
 `xnu/patches/` in order; the GPU user space and audio plug-in by `.github/workflows/userland.yml`.
+The same kernel build is a plain script, `build-rain/ci-build-xnu.sh`, for any Mac: `codemagic.yaml`
+runs it on Codemagic as a fallback when GitHub Actions is down (sign in there, add this repository, start the
+`xnu` workflow, download `kernel.development.sweet`). XNU needs Apple's Xcode and KDK, so some Mac has to build it.
 Locally you need `clang`/`lld`, `mkbootimg`, `fastboot`, `python3` and `gh`.
 
 ```bash
-build-rain/boot-probe.sh <actions-run-id> <patch-number> <tag> [extra boot args]
+build-rain/boot-probe.sh <actions-run-id | kernel file> <patch-number> <tag> [extra boot args]
 ```
 
 That downloads the kernel from the run, packs it with the device tree and boot arguments
