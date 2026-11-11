@@ -46,5 +46,7 @@ jobs:
           path: |
             userland/out-gpu/*.dylib
             userland/out-gpu/backboardd
+            userland/out-gpu/RedwoodAudio
+            userland/out-gpu/RedwoodAudio.Info.plist
             userland/out-gpu/eagl_gen.h
           if-no-files-found: error

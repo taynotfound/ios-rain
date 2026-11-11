@@ -20,6 +20,9 @@ $CC -dynamiclib -install_name /topaz/lib/libtopaz-gl.dylib -I"$O" -I"$G" -framew
 $CC -dynamiclib -install_name /topaz/lib/libtopaz-inject.dylib -framework CoreFoundation -framework IOKit -lobjc \
 	-o "$O/libtopaz-inject.dylib" "$G/topaz_inject.c"
 $CC -o "$O/backboardd" "$G/bbd_wrap.c"
+# CoreAudio HAL plug-in (the "Speaker" device writing to the kernel's /dev/redwood-audio)
+$CC -bundle -framework CoreFoundation -I"$G/../audio" -o "$O/RedwoodAudio" "$G/../audio/audio_plugin.c"
+cp "$G/../audio/audio_plugin.plist" "$O/RedwoodAudio.Info.plist"
 cp "$M/libOSMesa.8.dylib" "$O/"
 rm -rf "$O/inc"
 ls -l "$O"
