@@ -2,6 +2,8 @@
 # Build a boot image from a CI kernel and fastboot-boot it once the phone answers.
 #   build-rain/boot-probe.sh <run-id> <patch-no> <tag> [extra cmdline]
 # e.g. build-rain/boot-probe.sh 42492125916 0979 C10
+# Debugging a probe that ends in a panic: pass '-v cpus=1 sweetfb_noconsole=0' as the 4th argument is not
+# enough (the first cpus= wins); edit the line below instead.
 # Needs research/fw-fog/novatek_ts_fw.bin (vendor firmware, not in git) for the touch stages.
 set -e
 cd "$(dirname "$0")/.."
@@ -12,7 +14,7 @@ rm -rf "xnu/out-$N" && gh run download "$R" -R taynotfound/ios-topaz -n xnu-kern
 FW=research/fw-fog/novatek_ts_fw.bin
 python3 tools/mkpayload.py "xnu/out-$N/kernel.development.sweet" build-rain/rain-ios.adt "build-rain/payload-$T.bin" \
   ${FW:+$( [ -f "$FW" ] && echo --blob TouchFW=$FW )} \
-  --cmdline "-v debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetchg=0 sweetfb_noshadow=1 sweetfb_fit=1 raintouch=1 sweettouchdelay=0 raintouchpause=0 $4" >/dev/null
+  --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetchg=0 sweetfb_noshadow=1 sweetfb_fit=1 raintouch=1 sweettouchdelay=0 raintouchpause=0 sweetfb_noconsole=1 sweetfb_hz=30 $4" >/dev/null
 PATH=$P/build-rain/bin:$PATH MKBOOTIMG=mkbootimg bash shim/build.sh "$P/build-rain/payload-$T.bin" >/dev/null 2>&1
 cp shim/out/shim-boot.img "build-rain/shim-xnu-rain-touch$T.img"
 # Xiaomi's ABL stops taking data after idling in fastboot: time the transfer out and wait for a fresh session
