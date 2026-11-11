@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 23:40:00 +0100
+Subject: [PATCH] rain-0993: charging indicator from the SMB1351
+
+rain's charger is an SMB1351 at 0x55 on QUP0 SE2. Read STATUS_4 (charging,
+done, hold-off) and IRQ_E (USBIN under-voltage = no cable), per Xiaomi's
+smb1351-charger.c, and hand iOS external power / charging, with or without
+a fuel gauge. Read-only.
+---
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 168ecae..81d9e4c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -28,6 +28,30 @@ extern "C" int sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *b
+  */
+ static int gauge_bus;
+ 
++/*
++ * rain: the charger is a Qualcomm SMB1351 at 0x55 on QUP0 SE2 (DT smb1351-charger@55; registers
++ * from Xiaomi's smb1351-charger.c). STATUS_4 (0x3a): bits 2:1 charging, bit 5 done, bit 3 hold-off;
++ * IRQ_E (0x44) bit 4: USBIN under-voltage, i.e. no cable. Only read: the charger runs on its own
++ * defaults (and its own safety timers and temperature limits).
++ */
++static bool
++rain_charger(bool *external, bool *charging, bool *done)
++{
++	uint8_t st4 = 0, irqe = 0;
++	if (sweet_i2c_bus_read(2, 0x55, 0x3a, &st4, 1) || sweet_i2c_bus_read(2, 0x55, 0x44, &irqe, 1)) {
++		return false;
++	}
++	*charging = (st4 & 0x06u) != 0 && !(st4 & 0x08u);
++	*done = (st4 & 0x20u) != 0;
++	*external = !(irqe & 0x10u) || *charging || *done;
++	static unsigned logs;
++	if (logs++ % 30 == 0) {
++		IOLog("SWEET BATTERY: smb1351 status4 %#x irq_e %#x: external=%d charging=%d done=%d\n",
++		    st4, irqe, *external, *charging, *done);
++	}
++	return true;
++}
++
+ static int
+ gauge_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
+ {
+@@ -386,6 +410,9 @@ SweetBattery::pollTopaz(void)
+ 	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
+ 	bool charging = external && (chrg == 1 || chrg == 2);
+ 	bool done = external && chrg == 3;
++	if (!chgOk) {
++		(void)rain_charger(&external, &charging, &done);
++	}
+ 	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
+ 	static unsigned logs;
+ 	if (logs++ % 20 == 0) {
+@@ -402,7 +429,12 @@ SweetBattery::poll(void)
+ 		return;
+ 	}
+ 	if (fReal) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		bool external = true, charging = false, done = true;
++		if (rain_charger(&external, &charging, &done)) {
++			publish(100, 4200, 0, external, external, charging, done || !charging, false, false);
++		} else {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
+ 		return;
+ 	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
