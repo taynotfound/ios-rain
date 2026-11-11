@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 20:20:00 +0100
+Subject: [PATCH] rain-0986: zap region of rain; phystokv panics name their callers
+
+With the GPU pool fixed (0985), backboardd opened RedwoodGPU and the kernel
+panicked: "phystokv_range: illegal PA: 0xebe0000; phys base 0xc0000000",
+with no backtrace on screen. Print four return addresses in that panic.
+Also: the zap shader's PIL region is pil_gpu_mem@56615000 on rain
+(topaz: 0x55B15000), same size 0x2000.
+---
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 2c794f1..dabf22a 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -64,7 +64,7 @@ uint32_t gpu_log;
+ #define SMMU_BASE       0x059A0000ull
+ #define SMMU_SIZE       0x10000
+ #define SMMU_CB0        0x8000
+-#define ZAP_REGION      0x55B15000ull
++#define ZAP_REGION      0x56615000ull     /* rain: pil_gpu_mem (topaz: 0x55B15000) */
+ #define ZAP_REGION_SIZE 0x2000
+ #define GPU_PAS_ID      13
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b926886..442dd86 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -377,8 +377,11 @@ phystokv(pmap_paddr_t pa)
+ 		}
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
+-		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+-		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
++		/* rain: who asked (a GPU path hands a bad address in; this panic had no backtrace on screen) */
++		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx; from %p %p %p %p", __func__,
++		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size,
++		    __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2),
++		    __builtin_return_address(3));
+ 	}
+ 	return pa - gPhysBase + gVirtBase;
+ }
+@@ -402,8 +405,11 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+ 		*max_len = len;
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
+-		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+-		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
++		/* rain: who asked (a GPU path hands a bad address in; this panic had no backtrace on screen) */
++		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx; from %p %p %p %p", __func__,
++		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size,
++		    __builtin_return_address(0), __builtin_return_address(1), __builtin_return_address(2),
++		    __builtin_return_address(3));
+ 	}
+ 	return pa - gPhysBase + gVirtBase;
+ }
