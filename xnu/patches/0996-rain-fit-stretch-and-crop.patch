@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 00:45:00 +0100
+Subject: [PATCH] rain-0996: sweetfb_fit=3, half stretch and half side crop
+
+The full stretch (+5.8 %) looked too tall. sweetfb_fit=3 fills the panel's
+height with half of it: iOS is scaled to 740x1650 (+3 %) and 10 columns
+(sweetfb_crop) are cut off each side. Touch maps through the same
+geometry. The hardware scaler path stays off in this mode.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a29db00..545e691 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1537,7 +1537,15 @@ rain_touch_run(unsigned stop)
+ 	unsigned errs = 0, tick = 0, dead = 0;
+ 	uint32_t fit = 1;
+ 	(void)PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+-	const unsigned top = fit == 2 ? 0u : 45u, high = fit == 2 ? 1650u : 1559u;   /* the picture's rows on the panel */
++	const unsigned top = fit >= 2 ? 0u : 45u, high = fit >= 2 ? 1650u : 1559u;   /* the picture's rows on the panel */
++	uint32_t crop = 0;      /* sweetfb_fit=3: the picture is 720 + 2 * crop wide, centred (as SweetFramebuffer) */
++	if (fit == 3) {
++		crop = 10;
++		(void)PE_parse_boot_argn("sweetfb_crop", &crop, sizeof(crop));
++		if (720 + 2 * crop > 1088) {
++			crop = 0;
++		}
++	}
+ 	rn.stage = "nvt run";
+ 	printf("RAIN TOUCH: firmware %02x up, %ux%u, polling every 10 ms\n", nf.info[0],
+ 	    ((uint32_t)nf.info[4] << 8) | nf.info[5], ((uint32_t)nf.info[6] << 8) | nf.info[7]);
+@@ -1584,7 +1592,7 @@ rain_touch_run(unsigned stop)
+ 			if (id < 1 || id > TOUCH_MAX || (status != 1 && status != 2) || px > 719 || py > 1649) {
+ 				continue;
+ 			}
+-			int hx = (int)(px * 1125u / 720u) - 20;
++			int hx = (int)((px + crop) * 1125u / (720u + 2 * crop)) - 20;
+ 			int hy = (py < top ? 0 : (int)((py - top) * 2436u / high)) - 18;
+ 			x[id - 1] = hx < 0 ? 0 : (hx > 1079 ? 1079 : hx);
+ 			y[id - 1] = hy < 0 ? 0 : (hy > 2399 ? 2399 : hy);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 80aa95d..ae9b25e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -172,6 +172,7 @@ public:
+ 	/* rain: sweetfb_fit=1 scales the logical canvas to the panel width (letterboxed) */
+ 	bool          fFit;
+ 	uint32_t      fFitH, fFitTop;           /* scaled canvas height, black bar above it */
++	uint32_t      fFitCrop;                 /* sweetfb_fit=3: panel columns cut off each side */
+ 	int32_t       fFitXs[1088];             /* per panel column: source x */
+ 	uint16_t      fFitXf[1088];             /* per panel column: x weight (0..256) */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+@@ -352,12 +353,25 @@ AppleCLCD::start(IOService *provider)
+ 	{
+ 		uint32_t fit = 0;
+ 		PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+-		/* 1: keep the shape, bars above and below; 2: stretch to the panel's height (rain: +5.8 %) */
+-		fFitH = fit == 2 ? fHeight : (uint32_t)(((uint64_t)fLogicalH * fWidth) / fLogicalW);
++		/*
++		 * 1: keep the shape, bars above and below; 2: stretch to the panel's height (rain: +5.8 %);
++		 * 3: half of each: scale to fWidth + 2 * crop wide and cut crop columns off each side
++		 * (sweetfb_crop, default 10: 740 wide, +3 % stretch, ~15 iOS points lost per side).
++		 */
++		fFitCrop = 0;
++		if (fit == 3) {
++			fFitCrop = 10;
++			PE_parse_boot_argn("sweetfb_crop", &fFitCrop, sizeof(fFitCrop));
++			if (fWidth + 2 * fFitCrop > 1088) {
++				fFitCrop = 0;
++			}
++		}
++		fFitH = fit >= 2 ? fHeight : (uint32_t)(((uint64_t)fLogicalH * fWidth) / fLogicalW);
+ 		fFit = fit != 0 && fLogicalW > fWidth && fWidth <= 1088 && fFitH <= fHeight;
+ 		fFitTop = fFit ? (fHeight - fFitH) / 2 : 0;
+ 		if (fFit) {
+-			IOLog("RAIN FB: fit %ux%u -> %ux%u at y %u\n", fLogicalW, fLogicalH, fWidth, fFitH, fFitTop);
++			IOLog("RAIN FB: fit %ux%u -> %ux%u at y %u, %u columns cut each side\n", fLogicalW, fLogicalH,
++			    fWidth + 2 * fFitCrop, fFitH, fFitTop, fFitCrop);
+ 		}
+ 	}
+ 	fLock = IOLockAlloc();
+@@ -1369,7 +1383,7 @@ sweet_fit_lerp(uint32_t a, uint32_t b, uint32_t f)
+ #define SWEET_FIT_ROW_MAX 2048         /* source row pixels the staging rows hold */
+ 
+ static void
+-sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH, uint32_t top,
++sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t crop, uint32_t fitH, uint32_t top,
+     uint32_t logicalW, uint32_t logicalH, const uint8_t *src, uint32_t stride, int32_t sx, int32_t sy,
+     int32_t lx, int32_t ly, int32_t lw, int32_t lh, int32_t *xs, uint16_t *xf)
+ {
+@@ -1388,8 +1402,12 @@ sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH,
+ 	if (py0 < 0) {
+ 		py0 = 0;
+ 	}
+-	if (px1 > (int64_t)panelW) {
+-		px1 = panelW;
++	/* panelW is the scaled width; only columns crop .. panelW - crop reach the panel */
++	if (px0 < (int64_t)crop) {
++		px0 = crop;
++	}
++	if (px1 > (int64_t)(panelW - crop)) {
++		px1 = panelW - crop;
+ 	}
+ 	if (py1 > (int64_t)fitH) {
+ 		py1 = fitH;
+@@ -1438,7 +1456,7 @@ sweet_fit_blit(uint8_t *dst, uint32_t dstStride, uint32_t panelW, uint32_t fitH,
+ 			r0 = rows[y0 & 1];
+ 			r1 = fy ? rows[(y0 + 1) & 1] : r0;
+ 		}
+-		uint32_t *out = (uint32_t *)(dst + (uint64_t)(top + py) * dstStride);
++		uint32_t *out = (uint32_t *)(dst + (uint64_t)(top + py) * dstStride) - crop;
+ 		for (int64_t px = px0; px < px1; px++) {
+ 			int32_t x = xs[px];
+ 			uint32_t fx = xf[px];
+@@ -1473,7 +1491,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	}
+ 	bool ok = false;
+ 	(void)topaz_surface_drawn(s, 100);
+-	if (fHwScale && s->gpuPool && s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
++	if (fHwScale && fFitCrop == 0 && s->gpuPool && s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width == fLogicalW && s->height == fLogicalH && (s->bytesPerRow & 0xf) == 0) {
+ 		uint64_t pa = s->scanoutPhys + s->offset;
+ 		if ((pa & 0xf) == 0 && pa + (uint64_t)s->height * s->bytesPerRow < (1ull << 32)) {
+@@ -1493,7 +1511,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 			uint8_t *dst = backBuffer();
+ 			bzero(dst, (size_t)fFitTop * fRowBytes);
+ 			bzero(dst + (uint64_t)(fFitTop + fFitH) * fRowBytes, (size_t)(fHeight - fFitTop - fFitH) * fRowBytes);
+-			sweet_fit_blit(dst, fRowBytes, fWidth, fFitH, fFitTop, fLogicalW, fLogicalH,
++			sweet_fit_blit(dst, fRowBytes, fWidth + 2 * fFitCrop, fFitCrop, fFitH, fFitTop, fLogicalW, fLogicalH,
+ 			    (const uint8_t *)(va + s->offset), s->bytesPerRow, 0, 0, 0, 0,
+ 			    (int32_t)fLogicalW, (int32_t)fLogicalH, fFitXs, fFitXf);
+ 			flipBack();
+@@ -1652,7 +1670,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h) * s->bytesPerRow;
+ 			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 && s->elementHeight == 1 &&
+ 			    s->memory != NULL && end <= s->memory->getLength()) {
+-				sweet_fit_blit(dst, fRowBytes, fWidth, fFitH, fFitTop, fLogicalW, fLogicalH,
++				sweet_fit_blit(dst, fRowBytes, fWidth + 2 * fFitCrop, fFitCrop, fFitH, fFitTop, fLogicalW, fLogicalH,
+ 				    (const uint8_t *)(src + s->offset), s->bytesPerRow, sx, sy, dx, dy, w, h, fFitXs, fFitXf);
+ 			}
+ 			s->release();
