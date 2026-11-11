@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 22:50:00 +0100
+Subject: [PATCH] rain-0991: vibration motor; fuel gauge on SE1 or SE2
+
+/dev/redwood-haptic (the RedwoodAudio plug-in's haptics output) drives the
+vibrator enable pin, TLMM GPIO 36 (DT vibrator_gpio; EAST tile): on while
+the waveform has strength, off after its duration. rainbuzz=1 buzzes once.
+SweetBattery looks for the SM5602 gauge (0x71) on SE1, then SE2 (gpio6/7),
+through a bus-2 read in sweet_i2c1.c, and keeps reading where it answered.
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864ab..ece6668 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/topaz_sta.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/rain_haptic.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+diff --git a/b/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+new file mode 100644
+index 0000000..1f1e715
+--- /dev/null
++++ b/bsd/dev/rain_haptic.c
+@@ -0,0 +1,116 @@
++/*
++ * rain: the vibration motor (DT vibrator_gpio: qcom,qpnp-vibrator-ldo switched by TLMM GPIO 36,
++ * EAST tile of pinctrl-khaje.c) behind /dev/redwood-haptic, where the RedwoodAudio HAL plug-in
++ * writes iOS's haptic waveforms (16-bit mono samples, userland/audio/audio_plugin.c
++ * actuator_write()). The motor is on/off only: on while the waveform has any strength, off
++ * again once that much audio time has passed.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void rain_haptic_init(void);
++
++#define HAPTIC_GPIO_PA   0x00d24000u     /* TLMM 0x400000 + EAST 0x900000 + 36 * 0x1000 */
++#define HAPTIC_RATE      48000u          /* the plug-in's sample rate */
++#define HAPTIC_LEVEL     1500            /* |sample| above this switches the motor on */
++
++static vm_offset_t hg;
++static thread_call_t haptic_off_call;
++
++static void
++haptic_motor(bool on)
++{
++	*(volatile uint32_t *)(hg + 4) = on ? 2u : 0u;     /* GPIO_IN_OUT: bit 1 = output level */
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++haptic_off(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	haptic_motor(false);
++}
++
++static int
++haptic_open(dev_t dev __unused, int flags __unused, int type __unused, struct proc *p __unused)
++{
++	return hg ? 0 : ENXIO;
++}
++
++static int
++haptic_close(dev_t dev __unused, int flags __unused, int type __unused, struct proc *p __unused)
++{
++	return 0;
++}
++
++static int
++haptic_write(dev_t dev __unused, struct uio *uio, int flags __unused)
++{
++	int16_t buf[512];
++	uint32_t frames = 0;
++	int peak = 0, err = 0;
++
++	while (uio_resid(uio) > 0 && err == 0) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++		err = uiomove((caddr_t)buf, (int)n, uio);
++		for (int i = 0; err == 0 && i < (int)(n / 2); i++) {
++			int v = buf[i] < 0 ? -buf[i] : buf[i];
++			peak = v > peak ? v : peak;
++		}
++		frames += (uint32_t)(n / 2);
++	}
++	if (err == 0 && peak > HAPTIC_LEVEL) {
++		uint64_t deadline;
++		uint32_t ms = frames * 1000u / HAPTIC_RATE + 15u;
++		haptic_motor(true);
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(haptic_off_call, deadline);       /* a later write moves it on */
++	}
++	return err;
++}
++
++static const struct cdevsw haptic_cdevsw = {
++	.d_open = haptic_open, .d_close = haptic_close, .d_read = eno_rdwrt, .d_write = haptic_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++void
++rain_haptic_init(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("rainhaptic", &on, sizeof(on));
++	if (!on || hg) {
++		return;
++	}
++	hg = ml_io_map(HAPTIC_GPIO_PA, 0x1000);
++	haptic_off_call = thread_call_allocate(haptic_off, NULL);
++	if (!hg || !haptic_off_call) {
++		printf("RAIN HAPTIC: no mapping\n");
++		hg = 0;
++		return;
++	}
++	*(volatile uint32_t *)(hg + 4) = 0;                /* low first, then output enable */
++	*(volatile uint32_t *)hg = (*(volatile uint32_t *)hg & ~0x3ffu) | (1u << 9);   /* GPIO function, OE, 2 mA */
++	__asm__ volatile("dsb sy" ::: "memory");
++	int major = cdevsw_add(-1, &haptic_cdevsw);
++	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
++	printf("RAIN HAPTIC: /dev/redwood-haptic %s (gpio36 ctl %#x)\n", node ? "ready" : "failed", *(volatile uint32_t *)hg);
++	uint32_t buzz = 0;                                /* boot-arg rainbuzz=1: one 300 ms buzz, to test */
++	if (PE_parse_boot_argn("rainbuzz", &buzz, sizeof(buzz)) && buzz && node) {
++		uint64_t deadline;
++		haptic_motor(true);
++		clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(haptic_off_call, deadline);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index 68d34f2..af69c5c 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -288,31 +288,84 @@ i2c_scan_bus(const char *name)
+ 	printf("RAIN I2C: %s: %u answer:%s\n", name, n, line);
+ }
+ 
+-static void
+-sweet_i2c_scan(void)
++/* rain: QUP0 SE2 (gpio6/7; DT: smb1351 charger, maybe the gauge) as a second bus. Call with the lock held. */
++static vm_offset_t i2c2_se;
++static int i2c2_state;          /* 0 not tried, 1 ready, -1 failed */
++
++static bool
++i2c2_up_locked(void)
+ {
+-	i2c_scan_bus("SE1 gpio4/5");
+-	vm_offset_t se1 = i2c1_se, se2 = ml_io_map(0x04a88000u, 0x4000);
++	if (i2c2_state) {
++		return i2c2_state > 0;
++	}
++	i2c2_state = -1;
++	vm_offset_t se2 = ml_io_map(0x04a88000u, 0x4000);
+ 	if (!se2) {
+-		return;
++		return false;
+ 	}
+ 	wr(i2c1_gcc, I2C1_GCC_VOTE, rd(i2c1_gcc, I2C1_GCC_VOTE) | (1u << 12));      /* qupv3_wrap0_s2 (gcc-khaje.c) */
+ 	if (!wait_clear(i2c1_gcc, 0x1f3a4u, 1u << 31)) {
+ 		printf("RAIN I2C: SE2 clock off (cbcr %#x)\n", rd(i2c1_gcc, 0x1f3a4u));
+-		return;
++		return false;
+ 	}
+ 	/* GPIO6/7: function 1 (qup2), 2 mA, no pull */
+ 	wr(i2c1_west, 0x6000, (rd(i2c1_west, 0x6000) & ~0x3ffu) | 0x4u);
+ 	wr(i2c1_west, 0x7000, (rd(i2c1_west, 0x7000) & ~0x3ffu) | 0x4u);
+-	lck_mtx_lock(&sweet_i2c1_lock);
++	vm_offset_t se1 = i2c1_se;
+ 	i2c1_se = se2;
+ 	int e = i2c1_engine();
+-	lck_mtx_unlock(&sweet_i2c1_lock);
+-	if (!e) {
+-		i2c_scan_bus("SE2 gpio6/7");
++	i2c1_se = se1;
++	if (e) {
++		return false;
++	}
++	i2c2_se = se2;
++	i2c2_state = 1;
++	printf("RAIN I2C: SE2 ready\n");
++	return true;
++}
++
++/* a register read on bus 1 (SE1) or 2 (SE2) */
++int sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
++int
++sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	if (bus == 1) {
++		return sweet_i2c1_read(addr, reg, buf, len);
++	}
++	if (bus != 2 || !i2c1_ready || len == 0 || len > 64) {
++		return ENXIO;
+ 	}
+ 	lck_mtx_lock(&sweet_i2c1_lock);
+-	i2c1_se = se1;
++	int err = ENXIO;
++	if (i2c2_up_locked()) {
++		vm_offset_t se1 = i2c1_se;
++		i2c1_se = i2c2_se;
++		err = i2c1_msg(addr, &reg, 1, NULL, 0, true);
++		if (!err) {
++			err = i2c1_msg(addr, NULL, 0, buf, len, false);
++		}
++		i2c1_se = se1;
++	}
+ 	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
++static void
++sweet_i2c_scan(void)
++{
++	i2c_scan_bus("SE1 gpio4/5");
++	lck_mtx_lock(&sweet_i2c1_lock);
++	bool up = i2c2_up_locked();
++	vm_offset_t se1 = i2c1_se;
++	if (up) {
++		i2c1_se = i2c2_se;
++	}
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	if (up) {
++		i2c_scan_bus("SE2 gpio6/7");    /* (it takes the lock per address) */
++		lck_mtx_lock(&sweet_i2c1_lock);
++		i2c1_se = se1;
++		lck_mtx_unlock(&sweet_i2c1_lock);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ba7bc05..1f0ea58 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void rain_haptic_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -823,6 +824,7 @@ sweet_ufs_init(void)
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_touch_init();
+ 	sweet_keys_init();
++	rain_haptic_init();
+ 	/* rain: the USB driver has rain's addresses and only runs with boot-arg sweetusb=N */
+ 	(void)hw;
+ 	sweet_usb_probe();
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index ed9a0c7..168ecae 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -20,6 +20,32 @@ extern "C" int sweet_i2c1_init(void);
+ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+ extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ extern "C" int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++extern "C" int sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
++
++/*
++ * rain: the SM5602 gauge (Xiaomi's fog kernel uses sm5602_fg) does not answer on SE1 as on topaz.
++ * Look for it on SE1, then SE2, once; afterwards read where it answered.
++ */
++static int gauge_bus;
++
++static int
++gauge_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	if (gauge_bus == 0) {
++		uint8_t probe[2];
++		for (int bus = 1; bus <= 2 && gauge_bus == 0; bus++) {
++			if (sweet_i2c_bus_read(bus, addr, 0x00, probe, 2) == 0) {
++				gauge_bus = bus;
++				IOLog("SWEET BATTERY: gauge 0x%02x answers on SE%d (id %02x%02x)\n", addr, bus, probe[1], probe[0]);
++			}
++		}
++		if (gauge_bus == 0) {
++			gauge_bus = -1;
++			IOLog("SWEET BATTERY: no gauge at 0x%02x on SE1 or SE2\n", addr);
++		}
++	}
++	return gauge_bus > 0 ? sweet_i2c_bus_read(gauge_bus, addr, reg, buf, len) : 6 /* ENXIO */;
++}
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -325,22 +351,22 @@ SweetBattery::pollTopaz(void)
+ {
+ 	uint8_t w[2], st = 0;
+ 	uint16_t soc, volt, cur, full;
+-	if (sweet_i2c1_read(0x71, 0x05, w, 2)) {
++	if (gauge_read(0x71, 0x05, w, 2)) {
+ 		return false;
+ 	}
+ 	soc = (uint16_t)(w[0] | w[1] << 8);
+-	if (sweet_i2c1_read(0x71, 0x07, w, 2)) {
++	if (gauge_read(0x71, 0x07, w, 2)) {
+ 		return false;
+ 	}
+ 	volt = (uint16_t)(w[0] | w[1] << 8);
+-	if (sweet_i2c1_read(0x71, 0x08, w, 2)) {
++	if (gauge_read(0x71, 0x08, w, 2)) {
+ 		return false;
+ 	}
+ 	cur = (uint16_t)(w[0] | w[1] << 8);
+-	bool fullOk = sweet_i2c1_read(0x71, 0x62, w, 2) == 0;
++	bool fullOk = gauge_read(0x71, 0x62, w, 2) == 0;
+ 	full = fullOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+ 	bool chgOk = sweet_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
+-	bool texOk = sweet_i2c1_read(0x71, 0x0a, w, 2) == 0;
++	bool texOk = gauge_read(0x71, 0x0a, w, 2) == 0;
+ 	int tenths = texOk ? topaz_ntc_tenths((uint16_t)(w[0] | w[1] << 8)) : 250;
+ 	if (chgOk && texOk) {
+ 		topaz_charger(st, tenths);
