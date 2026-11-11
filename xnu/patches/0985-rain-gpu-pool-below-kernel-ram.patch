@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 20:00:00 +0100
+Subject: [PATCH] rain-0985: GPU pool 0x90000000-0xC0000000
+
+First gpu=1 boot panicked: "IOMemoryDescriptor physical with managed page
+0x90000000:0x4000000", then pmap_enter_pv: unexpected PV head. topaz's
+GPU pool (1 GB at 0x90000000) is unmanaged there; on rain the --midmem
+ADT gave the kernel 0x80000000 + 3 GiB. Kernel RAM moves to the 0xC0000000
+bank (2 GiB) and the pool shrinks to 768 MB, ending where that bank starts.
+---
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..2c794f1 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -160,7 +160,12 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
+  */
+ #define GPU_POOL_BASE       0x90000000ull
+-#define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
++/*
++ * rain: 768 MB, 0x90000000-0xC0000000, the rest of the 0x80000000 bank. The kernel's RAM is the
++ * 0xC0000000 bank (mkadt.py --midmem with MIDBASE=0xc0000000 MIDSIZE=0x80000000); topaz's 1 GB
++ * ran into it (pmap_enter_pv: unexpected PV head on a managed page).
++ */
++#define GPU_POOL_SIZE       0x30000000ull
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
