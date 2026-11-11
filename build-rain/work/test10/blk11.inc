@@ -16,6 +16,8 @@
 
 static struct {
 	uint32_t fwpa, fwlen, nparts, tries, wrote;
+	const volatile uint8_t *fw;           /* mapped firmware image, kept for reloads */
+	uint32_t reloads, reload_fail;
 	int err;
 	uint8_t rst[5], crcflag;
 	uint32_t rilm, rdlm;
@@ -178,7 +180,8 @@ rain_nvt_bringup(void)
 		return;
 	}
 	rn.stage = "nvt fw download";
-	nf.err = rain_nvt_download((const volatile uint8_t *)fw, nf.fwlen);
+	nf.fw = (const volatile uint8_t *)fw;
+	nf.err = rain_nvt_download(nf.fw, nf.fwlen);
 	if (nf.err) {
 		rn.err = nf.err;
 		return;
@@ -200,18 +203,51 @@ rain_nvt_bringup(void)
  */
 static void rain_touch_report(void);
 
+/*
+ * The NT36525B is display driver and touch controller in one, and its touch firmware
+ * lives in RAM: a panel reset or sleep (iOS taking the display, screen off/on) drops it.
+ * Xiaomi's driver reloads on every resume. Here: once a second read the firmware info
+ * (version + ~version = 0xff) and reload after two bad readings in a row.
+ */
+static bool
+rain_nvt_alive(void)
+{
+	uint8_t v[2] = { 0, 0 };
+	return !rain_nvt_read(NVT_EVENT_BUF | 0x78u, v, 2) && (uint8_t)(v[0] + v[1]) == 0xffu && v[0] != 0xffu && v[0] != 0;
+}
+
+static void
+rain_nvt_reload(void)
+{
+	touch_report(0, st.x, st.y);                  /* lift every finger first */
+	(void)rain_nvt_write(RAIN_NVT_ENGRST, 0x5a);
+	touch_wait(1);
+	int e = rain_nvt_download(nf.fw, nf.fwlen);
+	nf.reloads++;
+	nf.reload_fail += e != 0;
+	printf("RAIN TOUCH: firmware lost, reload %u err=%d\n", nf.reloads, e);
+	touch_wait(50);
+}
+
 /* stop (raintouchpanic): 2 = panic at the first finger, 3 = panic 3 s after it with statistics */
 static void
 rain_touch_run(unsigned stop)
 {
 	uint8_t pd[60];
-	unsigned errs = 0;
+	unsigned errs = 0, tick = 0, dead = 0;
 	rn.stage = "nvt run";
 	printf("RAIN TOUCH: firmware %02x up, %ux%u, polling every 10 ms\n", nf.info[0],
 	    ((uint32_t)nf.info[4] << 8) | nf.info[5], ((uint32_t)nf.info[6] << 8) | nf.info[7]);
 	for (;;) {
 		int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
 		uint32_t mask = 0;
+		if (++tick % 100u == 0) {
+			dead = rain_nvt_alive() ? 0 : dead + 1;
+			if (dead >= 2) {
+				rain_nvt_reload();
+				dead = 0;
+			}
+		}
 		if (rain_nvt_read(NVT_EVENT_BUF, pd, sizeof(pd))) {
 			if (++errs == 10) {
 				touch_report(0, st.x, st.y);    /* release after persistent bad reads */

@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 19:40:00 +0100
+Subject: [PATCH] rain-0983: touch C14, reload the NT36525B firmware when it is lost
+
+C13: clean single-finger tracking on the console, 117 HID events, yet
+nothing on the lock screen. The chip is a TDDI with its touch firmware in
+RAM; a panel reset or sleep drops it. Check the firmware info once a
+second and download again after two bad readings.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 86f8ff9..ca4c01f 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1297,6 +1297,8 @@ rain_nvt_read(uint32_t addr, uint8_t *out, unsigned n)
+ 
+ static struct {
+ 	uint32_t fwpa, fwlen, nparts, tries, wrote;
++	const volatile uint8_t *fw;           /* mapped firmware image, kept for reloads */
++	uint32_t reloads, reload_fail;
+ 	int err;
+ 	uint8_t rst[5], crcflag;
+ 	uint32_t rilm, rdlm;
+@@ -1459,7 +1461,8 @@ rain_nvt_bringup(void)
+ 		return;
+ 	}
+ 	rn.stage = "nvt fw download";
+-	nf.err = rain_nvt_download((const volatile uint8_t *)fw, nf.fwlen);
++	nf.fw = (const volatile uint8_t *)fw;
++	nf.err = rain_nvt_download(nf.fw, nf.fwlen);
+ 	if (nf.err) {
+ 		rn.err = nf.err;
+ 		return;
+@@ -1481,18 +1484,51 @@ rain_nvt_bringup(void)
+  */
+ static void rain_touch_report(void);
+ 
++/*
++ * The NT36525B is display driver and touch controller in one, and its touch firmware
++ * lives in RAM: a panel reset or sleep (iOS taking the display, screen off/on) drops it.
++ * Xiaomi's driver reloads on every resume. Here: once a second read the firmware info
++ * (version + ~version = 0xff) and reload after two bad readings in a row.
++ */
++static bool
++rain_nvt_alive(void)
++{
++	uint8_t v[2] = { 0, 0 };
++	return !rain_nvt_read(NVT_EVENT_BUF | 0x78u, v, 2) && (uint8_t)(v[0] + v[1]) == 0xffu && v[0] != 0xffu && v[0] != 0;
++}
++
++static void
++rain_nvt_reload(void)
++{
++	touch_report(0, st.x, st.y);                  /* lift every finger first */
++	(void)rain_nvt_write(RAIN_NVT_ENGRST, 0x5a);
++	touch_wait(1);
++	int e = rain_nvt_download(nf.fw, nf.fwlen);
++	nf.reloads++;
++	nf.reload_fail += e != 0;
++	printf("RAIN TOUCH: firmware lost, reload %u err=%d\n", nf.reloads, e);
++	touch_wait(50);
++}
++
+ /* stop (raintouchpanic): 2 = panic at the first finger, 3 = panic 3 s after it with statistics */
+ static void
+ rain_touch_run(unsigned stop)
+ {
+ 	uint8_t pd[60];
+-	unsigned errs = 0;
++	unsigned errs = 0, tick = 0, dead = 0;
+ 	rn.stage = "nvt run";
+ 	printf("RAIN TOUCH: firmware %02x up, %ux%u, polling every 10 ms\n", nf.info[0],
+ 	    ((uint32_t)nf.info[4] << 8) | nf.info[5], ((uint32_t)nf.info[6] << 8) | nf.info[7]);
+ 	for (;;) {
+ 		int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
+ 		uint32_t mask = 0;
++		if (++tick % 100u == 0) {
++			dead = rain_nvt_alive() ? 0 : dead + 1;
++			if (dead >= 2) {
++				rain_nvt_reload();
++				dead = 0;
++			}
++		}
+ 		if (rain_nvt_read(NVT_EVENT_BUF, pd, sizeof(pd))) {
+ 			if (++errs == 10) {
+ 				touch_report(0, st.x, st.y);    /* release after persistent bad reads */
+@@ -1756,9 +1792,9 @@ rain_touch_report(void)
+ 		rain_reboot_fastboot();
+ 	}
+ 	rain_smmu_cbscan();
+-	panic("RAIN TOUCH C13: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
++	panic("RAIN TOUCH C14: step %u '%s' err=%d xf=%u smmu=%d cb=%d | SMMU cr0 %#x->%#x gfsr=%#x gfsynr0=%#x gfsynr1(sid)=%#x gfsynr2=%#x gfar=%#x%08x cbfsr=%#x cbfar=%#x%08x cbfsynr0=%#x | ifdis=%#x | GPI pre ch0=%#x ch1=%#x ev=%#x | ev=%#x ch0=%#x ch1=%#x "
+ 	    "go0=%#x go1=%#x | FAIL ch0=%#x ch1=%#x rp0=%#x wp0=%#x evrp=%#x type=%#x glob=%#x gpii=%#x "
+-	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x | FW pa=%#x len=%#x parts=%u try=%u wrote=%#x err=%d rst %02x %02x crcflag=%#x rilm=%#x rdlm=%#x | INFO %02x %02x x%u y%u max %u %u | TOUCH polls=%u downs=%u panel %u,%u hid %u,%u raw %02x %02x %02x %02x %02x %02x %02x | T3 frames=%u empty=%u maxfingers=%u ids=%#x id1 %u,%u -> %u,%u hid down=%u up=%u | first %02x %02x %02x %02x %02x %02x / %02x %02x %02x %02x %02x %02x / %02x %02x %02x %02x %02x %02x",
++	    "err=%#x src=%#x | ev n=%u w2=%#x w3=%#x rx=%#x %#x %#x imm=%u uc=%d pa=%#llx | cached %02x %02x %02x %02x | id %02x %02x %02x %02x %02x %02x | old %02x %02x %02x %02x %02x %02x | lb %02x %02x %02x %02x %02x %02x %02x %02x | pins %x %x %x %x | e3 nv=%u slot=%u smr=%#x s2cr=%#x sctlr=%#x id=%d | cbf %d fsr=%#x far=%#x syn=%#x sid=%#x | FW pa=%#x len=%#x parts=%u try=%u wrote=%#x err=%d rst %02x %02x crcflag=%#x rilm=%#x rdlm=%#x | INFO %02x %02x x%u y%u max %u %u | TOUCH polls=%u downs=%u panel %u,%u hid %u,%u raw %02x %02x %02x %02x %02x %02x %02x | reloads=%u fail=%u | T3 frames=%u empty=%u maxfingers=%u ids=%#x id1 %u,%u -> %u,%u hid down=%u up=%u | first %02x %02x %02x %02x %02x %02x / %02x %02x %02x %02x %02x %02x / %02x %02x %02x %02x %02x %02x",
+ 	    rain_step, rn.stage ? rn.stage : "?", rn.err, rn.xfers, rain_smmu, sm.cb,
+ 	    sm.cr0_was, sm.cr0_now, sm.gfsr, sm.gfsynr0, sm.gfsynr1, sm.gfsynr2, sm.gfar_hi, sm.gfar_lo,
+ 	    sm.cbfsr, sm.cbfar_hi, sm.cbfar_lo, sm.cbfsynr0, rn.ifdis,
+@@ -1775,7 +1811,7 @@ rain_touch_report(void)
+ 	    nf.info[0], nf.info[1], nf.info[2], nf.info[3], ((uint32_t)nf.info[4] << 8) | nf.info[5], ((uint32_t)nf.info[6] << 8) | nf.info[7],
+ 	    nf.polls, nf.downs, nf.fx, nf.fy, nf.lx, nf.ly,
+ 	    nf.raw[0], nf.raw[1], nf.raw[2], nf.raw[3], nf.raw[4], nf.raw[5], nf.raw[6],
+-	    nf.t3_frames, nf.t3_empty, nf.t3_max, nf.t3_ids, nf.t3_x0, nf.t3_y0, nf.t3_x1, nf.t3_y1, st.s_down, st.s_up,
++	    nf.reloads, nf.reload_fail, nf.t3_frames, nf.t3_empty, nf.t3_max, nf.t3_ids, nf.t3_x0, nf.t3_y0, nf.t3_x1, nf.t3_y1, st.s_down, st.s_up,
+ 	    nf.t3_first[0], nf.t3_first[1], nf.t3_first[2], nf.t3_first[3], nf.t3_first[4], nf.t3_first[5],
+ 	    nf.t3_first[6], nf.t3_first[7], nf.t3_first[8], nf.t3_first[9], nf.t3_first[10], nf.t3_first[11],
+ 	    nf.t3_first[12], nf.t3_first[13], nf.t3_first[14], nf.t3_first[15], nf.t3_first[16], nf.t3_first[17]);

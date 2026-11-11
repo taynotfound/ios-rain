@@ -22,15 +22,23 @@ static int rain_spi(uint32_t op, const uint8_t *tx, uint8_t *rx, unsigned n) { r
 static int rain_nvt_write(uint32_t a, uint8_t v) { return 0; }
 /* frames: finger id 1 at panel (0,45), then id 2 at (719,1603), then nothing, then end */
 static int frame;
+static int dead_fw, nreads;
+static uint32_t *rl, *rf;
+#define RAIN_NVT_ENGRST 0x7fff80u
 static void put(uint8_t *f, unsigned id, unsigned x, unsigned y) { f[0] = id << 3 | 1; f[1] = x >> 4; f[2] = y >> 4; f[3] = (x & 15) << 4 | (y & 15); }
 static int rain_nvt_read(uint32_t a, uint8_t *o, unsigned n) {
 	memset(o, 0, n);
+	if (a == (0x21c00u | 0x78u)) { if (!dead_fw) { o[0] = 0x0d; o[1] = 0xf2; } return 0; }
+	if (a == (0x21c00u | 0x60u)) { o[0] = 0xa0; return 0; }
+	if (dead_fw && ++nreads > 450) { assert(*rl == 2 && *rf == 0); puts("reload after 2 dead checks OK"); exit(0); }
+	if (dead_fw) return 0;
 	if (frame == 0) put(o, 1, 0, 45);
 	if (frame == 1) put(o + 6, 2, 719, 1603);
 	if (frame == 2) put(o, 3, 800, 100);          /* out of range: ignored */
 	return 0;
 }
 static void touch_report(uint32_t mask, const int *x, const int *y) {
+	if (dead_fw) return;
 	if (frame == 0) assert(mask == 1 && x[0] == 0 && y[0] == 0);
 	if (frame == 1) assert(mask == 2 && x[1] == 1079 && y[1] == 2399);
 	if (frame == 2) { assert(mask == 0); puts("run loop mapping OK"); exit(0); }
@@ -39,4 +47,4 @@ static void touch_report(uint32_t mask, const int *x, const int *y) {
 static void touch_wait(unsigned ms) {}
 #include "blk11.inc"
 static void rain_touch_report(void) { puts("report"); exit(2); }
-int main(void) { rain_touch_run(0); return 1; }
+int main(int c, char **v) { dead_fw = c > 1; rl = &nf.reloads; rf = &nf.reload_fail; static uint8_t img[0x1d000]; FILE *f = fopen("../../../research/fw-fog/novatek_ts_fw.bin", "rb"); nf.fwlen = (uint32_t)fread(img, 1, sizeof img, f); nf.fw = img; rain_touch_run(0); return 1; }
