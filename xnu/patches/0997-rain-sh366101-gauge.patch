@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 01:00:00 +0100
+Subject: [PATCH] rain-0997: SH366101 fuel gauge; log the first haptic writes
+
+rain's gauge is a Sinowealth SH366101 at QUP0 SE1 0x55 (DT sh,sh366101),
+not the SM5602 at 0x71: state of charge, voltage, current and
+temperature by TI-style commands 0x2c/0x08/0x0c/0x06, checked for
+plausibility, charging state from the SMB1351. The motor driver logs its
+first eight writes, to see whether iOS's haptics reach it.
+---
+diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+index 1f1e715..500dd64 100644
+--- a/bsd/dev/rain_haptic.c
++++ b/bsd/dev/rain_haptic.c
+@@ -68,6 +68,11 @@ haptic_write(dev_t dev __unused, struct uio *uio, int flags __unused)
+ 		}
+ 		frames += (uint32_t)(n / 2);
+ 	}
++	static unsigned said;
++	if (err == 0 && said < 8) {
++		said++;
++		printf("RAIN HAPTIC: write %u frames, peak %d%s\n", frames, peak, peak > HAPTIC_LEVEL ? " -> motor" : "");
++	}
+ 	if (err == 0 && peak > HAPTIC_LEVEL) {
+ 		uint64_t deadline;
+ 		uint32_t ms = frames * 1000u / HAPTIC_RATE + 15u;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 81d9e4c..71ba776 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -422,12 +422,49 @@ SweetBattery::pollTopaz(void)
+ 	return true;
+ }
+ 
++/*
++ * rain: the gauge is a Sinowealth SH366101 at QUP0 SE1 0x55 (DT "sh,sh366101"), read with the
++ * TI-style 16-bit little-endian commands: 0x2c state of charge %, 0x08 mV, 0x0c mA (signed),
++ * 0x06 temperature in 0.1 K. Implausible readings fall through to the fallback.
++ */
++static bool
++rain_gauge(unsigned *percent, unsigned *mv, int *ma, int *tenthsC)
++{
++	uint8_t w[2];
++	uint16_t v[4];
++	static const uint8_t regs[4] = { 0x2c, 0x08, 0x0c, 0x06 };
++	for (int i = 0; i < 4; i++) {
++		if (sweet_i2c_bus_read(1, 0x55, regs[i], w, 2)) {
++			return false;
++		}
++		v[i] = (uint16_t)(w[0] | w[1] << 8);
++	}
++	*percent = v[0];
++	*mv = v[1];
++	*ma = (int16_t)v[2];
++	*tenthsC = (int)v[3] - 2731;
++	static unsigned logs;
++	if (logs++ % 20 == 0) {
++		IOLog("SWEET BATTERY: sh366101 soc %u%% %umV %dmA %d.%d C (raw %04x %04x %04x %04x)\n", *percent, *mv, *ma,
++		    *tenthsC / 10, (*tenthsC < 0 ? -*tenthsC : *tenthsC) % 10, v[0], v[1], v[2], v[3]);
++	}
++	return *percent <= 100 && *mv >= 2800 && *mv <= 4600;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+ 	if (fReal && pollTopaz()) {
+ 		return;
+ 	}
++	unsigned percent, mv;
++	int ma, tenthsC;
++	if (fReal && rain_gauge(&percent, &mv, &ma, &tenthsC)) {
++		bool external = false, charging = false, done = false;
++		(void)rain_charger(&external, &charging, &done);
++		publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++		return;
++	}
+ 	if (fReal) {
+ 		bool external = true, charging = false, done = true;
+ 		if (rain_charger(&external, &charging, &done)) {
