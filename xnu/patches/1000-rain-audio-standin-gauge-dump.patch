@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 01:45:00 +0100
+Subject: [PATCH] rain-1000: stand-in /dev/redwood-audio, haptic open log,
+ SH366101 register dump
+
+rain's ADSP boots (PAS auth OK) and speaks APR ("apr_audio_svc"), so
+there is no audio sink yet. A stand-in /dev/redwood-audio logs whether
+the RedwoodAudio HAL plug-in starts and whether iOS plays, and drops the
+samples. /dev/redwood-haptic logs who opens it. The gauge's TI-style
+words were nonsense: dump 0x00-0x7f once to find its layout.
+---
+diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+index 500dd64..9f93664 100644
+--- a/bsd/dev/rain_haptic.c
++++ b/bsd/dev/rain_haptic.c
+@@ -10,6 +10,8 @@
+ #include <sys/systm.h>
+ #include <sys/conf.h>
+ #include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
+ #include <sys/errno.h>
+ #include <kern/thread_call.h>
+ #include <kern/clock.h>
+@@ -41,8 +43,12 @@ haptic_off(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ }
+ 
+ static int
+-haptic_open(dev_t dev __unused, int flags __unused, int type __unused, struct proc *p __unused)
++haptic_open(dev_t dev __unused, int flags __unused, int type __unused, struct proc *p)
+ {
++	static unsigned said;
++	if (said++ < 4) {
++		printf("RAIN HAPTIC: opened by %s[%d]\n", p != NULL ? proc_best_name(p) : "?", p != NULL ? proc_pid(p) : -1);
++	}
+ 	return hg ? 0 : ENXIO;
+ }
+ 
+@@ -83,6 +89,50 @@ haptic_write(dev_t dev __unused, struct uio *uio, int flags __unused)
+ 	return err;
+ }
+ 
++/*
++ * rain: a stand-in /dev/redwood-audio until the APR audio driver exists. It shows whether the
++ * RedwoodAudio HAL plug-in starts (it opens this in initialize()) and whether iOS plays sound;
++ * the samples are dropped.
++ */
++static int
++astub_open(dev_t dev __unused, int flags __unused, int type __unused, struct proc *p)
++{
++	static unsigned said;
++	if (said++ < 4) {
++		printf("RAIN AUDIO: /dev/redwood-audio opened by %s[%d]\n", p != NULL ? proc_best_name(p) : "?", p != NULL ? proc_pid(p) : -1);
++	}
++	return 0;
++}
++
++static int
++astub_write(dev_t dev __unused, struct uio *uio, int flags __unused)
++{
++	static unsigned said;
++	user_ssize_t n = uio_resid(uio);
++	if (said < 4 && n > 0) {
++		said++;
++		printf("RAIN AUDIO: iOS plays (%lld bytes dropped: no APR driver yet)\n", (long long)n);
++	}
++	uio_update(uio, (user_size_t)n);
++	return 0;
++}
++
++static int
++astub_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, struct proc *p __unused)
++{
++	if (cmd == _IOW('r', 1, struct { uint32_t below, muted; })) {
++		const uint32_t *v = (const uint32_t *)data;
++		printf("RAIN AUDIO: volume %u/8 dB under the top%s\n", v[0], v[1] ? ", muted" : "");
++	}
++	return 0;
++}
++
++static const struct cdevsw astub_cdevsw = {
++	.d_open = astub_open, .d_close = haptic_close, .d_read = eno_rdwrt, .d_write = astub_write,
++	.d_ioctl = astub_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
+ static const struct cdevsw haptic_cdevsw = {
+ 	.d_open = haptic_open, .d_close = haptic_close, .d_read = eno_rdwrt, .d_write = haptic_write,
+ 	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
+@@ -110,6 +160,9 @@ rain_haptic_init(void)
+ 	int major = cdevsw_add(-1, &haptic_cdevsw);
+ 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
+ 	printf("RAIN HAPTIC: /dev/redwood-haptic %s (gpio36 ctl %#x)\n", node ? "ready" : "failed", *(volatile uint32_t *)hg);
++	int amajor = cdevsw_add(-1, &astub_cdevsw);
++	void *anode = amajor < 0 ? NULL : devfs_make_node(makedev(amajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++	printf("RAIN AUDIO: stand-in /dev/redwood-audio %s\n", anode ? "ready" : "failed");
+ 	uint32_t buzz = 0;                                /* boot-arg rainbuzz=1: one 300 ms buzz, to test */
+ 	if (PE_parse_boot_argn("rainbuzz", &buzz, sizeof(buzz)) && buzz && node) {
+ 		uint64_t deadline;
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 56f54a4..9820f28 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -433,6 +433,19 @@ rain_gauge(unsigned *percent, unsigned *mv, int *ma, int *tenthsC)
+ 	uint8_t w[2];
+ 	uint16_t v[4];
+ 	static const uint8_t regs[4] = { 0x2c, 0x08, 0x0c, 0x06 };
++	static bool dumped;
++	if (!dumped) {
++		/* the TI layout gave nonsense (soc 0x128b, 0x00a0 mV): one dump of 0x00-0x7f to find the real one */
++		dumped = true;
++		for (unsigned r = 0; r < 0x80; r += 16) {
++			uint8_t b[16];
++			for (unsigned i = 0; i < 16; i++) {
++				b[i] = sweet_i2c_bus_read(1, 0x55, (uint8_t)(r + i), &b[i], 1) ? 0xee : b[i];
++			}
++			IOLog("SWEET BATTERY: sh366101 %02x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", r,
++			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++		}
++	}
+ 	for (int i = 0; i < 4; i++) {
+ 		/* byte by byte: in one 2-byte read the second byte came back wrong (0x08 gave 00eb for 4331 mV) */
+ 		if (sweet_i2c_bus_read(1, 0x55, regs[i], &w[0], 1) || sweet_i2c_bus_read(1, 0x55, regs[i] + 1, &w[1], 1)) {
