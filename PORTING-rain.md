@@ -135,6 +135,17 @@ Flash notes: ABL does not report `max-download-size` and rejects a 3.4 GB chunk 
 
 **Open issue:** with shadow/flip buffers enabled, AppleCLCD::start hangs at the fCons allocation or the memcpy from the boot FB surface (step 3/4 of patch 0960). `sweetfb_noshadow=1` is a workaround; iOS frames will need the flip buffers later.
 
+## USB live log (patch 0988)
+
+Boot an image with `sweetusb=2` (`build-rain/shim-xnu-rain-usb2.img`). The phone appears as USB device
+`1209:0001` with a CDC-ECM network link (MAC `02:00:5e:77:ee:01`) and sends its kernel console to
+192.168.7.1:5140 over UDP. PC side, once:
+
+- NetworkManager profile `ios-rain-usb` (matches that MAC, 192.168.7.1/24, no default route)
+- ufw: `sudo ufw allow in on enp2s0f0u3 to any port 5140 proto udp`
+
+Then `build-rain/usblog.py build-rain/logs/NAME.txt` collects the log (`ping 192.168.7.2` checks the link).
+
 ## Milestone 2 (next): iOS root in userdata
 
 **Source:** Apple CDN, `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`, 5.75 GiB, still signed, SHA-256 starts `ece1194f7e233e91` (ipsw.me API):
