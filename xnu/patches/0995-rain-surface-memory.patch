@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 00:30:00 +0100
+Subject: [PATCH] rain-0995: surface memory: early screen reserve, no repeated
+ contiguous scans, a lower cap, stats in the INTF1 line
+
+The UI froze after a few minutes while the kernel lived: wired pages climbed
+to 111k of 128k and every screen-sized surface ran a failed contiguous scan
+(vm_page_find_contiguous ... found 0 pages). The reserve now fills at
+IOCoreSurfaceRoot start (it got 0 of 10 at the first surface), a size that
+failed contiguous is not tried again, surfaces are capped at 768 MB of the
+2 GiB, and the 5 s INTF1 line prints wired/free pages and live surfaces.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5a35a1b..80aa95d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,8 @@ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
+ extern "C" void topaz_audio_init(void);
++extern "C" void sweet_surface_stats(uint64_t *wired, uint32_t *live);
++extern "C" unsigned int vm_page_wire_count, vm_page_free_count;
+ extern "C" void sweet_amfi_service_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+@@ -546,8 +548,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (fb->fIntf1 != NULL && (count % 300) == 0) {
+ 		uint32_t frames = fb->fIntf1[(0x800 + 0x0ac) / 4];
+-		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x)\n",
+-		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
++		uint64_t sw;
++		uint32_t sn;
++		sweet_surface_stats(&sw, &sn);
++		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x); mem: %u pages wired, %u free, %u surfaces %llu MB\n",
++		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4],
++		    vm_page_wire_count, vm_page_free_count, sn, sw >> 20);
+ 		fb->fIntfFrames = frames;
+ 	}
+ 	if (fb->fPowerOff) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e17297a..ae846b5 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -112,7 +112,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+-#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++#define SWEET_SURFACE_WIRED_MAX         (768ull << 20)    /* rain: the kernel has 2 GiB; a leak must fail creates, not starve the system */
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+ #define SWEET_SCANOUT_SLOT      (16u << 20)
+@@ -668,6 +668,13 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	{
++		/* rain: set the screen buffers aside now, before RAM fragments (at the first surface it got 0 of 10) */
++		uint32_t on = 0;
++		if (PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0) {
++			sweet_res_fill();
++		}
++	}
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -1092,10 +1099,19 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
+-			if (mem == NULL && gpu_low && take <= (16u << 20)) {
++			/*
++			 * rain: a failed contiguous allocation scans all of RAM twice (~0.1 s); once one size
++			 * failed, don't try that size or larger again.
++			 * shortcut: never retried after fragmentation, upgrade if RAM gets compacted.
++			 */
++			static uint64_t contig_failed = ~0ull;
++			if (mem == NULL && gpu_low && take <= (16u << 20) && take < contig_failed) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);
++				if (mem == NULL) {
++					contig_failed = take;
++				}
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -1714,3 +1730,11 @@ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 in
+ 	return &sweet_surface_traps[index];
+ }
+ #endif /* SWEET */
++
++/* rain: for the 5 s INTF1 line, to see what holds memory */
++extern "C" void
++sweet_surface_stats(uint64_t *wired, uint32_t *live)
++{
++	*wired = sweet_surface_wired;
++	*live = SweetSurface::metaClass->getInstanceCount();
++}
