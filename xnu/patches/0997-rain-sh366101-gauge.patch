@@ -11,8 +11,6 @@ first eight writes, to see whether iOS's haptics reach it.
 ---
 diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
 index 1f1e715..500dd64 100644
-diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
-index 1f1e715..500dd64 100644
 --- a/bsd/dev/rain_haptic.c
 +++ b/bsd/dev/rain_haptic.c
 @@ -68,6 +68,11 @@ haptic_write(dev_t dev __unused, struct uio *uio, int flags __unused)
