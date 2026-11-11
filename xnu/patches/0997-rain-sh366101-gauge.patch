@@ -11,6 +11,8 @@ first eight writes, to see whether iOS's haptics reach it.
 ---
 diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
 index 1f1e715..500dd64 100644
+diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+index 1f1e715..500dd64 100644
 --- a/bsd/dev/rain_haptic.c
 +++ b/bsd/dev/rain_haptic.c
 @@ -68,6 +68,11 @@ haptic_write(dev_t dev __unused, struct uio *uio, int flags __unused)
@@ -26,7 +28,7 @@ index 1f1e715..500dd64 100644
  		uint64_t deadline;
  		uint32_t ms = frames * 1000u / HAPTIC_RATE + 15u;
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 81d9e4c..71ba776 100644
+index 81d9e4c..d90bb1b 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -422,12 +422,49 @@ SweetBattery::pollTopaz(void)
@@ -68,12 +70,12 @@ index 81d9e4c..71ba776 100644
  	if (fReal && pollTopaz()) {
  		return;
  	}
-+	unsigned percent, mv;
-+	int ma, tenthsC;
-+	if (fReal && rain_gauge(&percent, &mv, &ma, &tenthsC)) {
-+		bool external = false, charging = false, done = false;
-+		(void)rain_charger(&external, &charging, &done);
-+		publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
++	unsigned gPercent, gMv;
++	int gMa, gTenths;
++	if (fReal && rain_gauge(&gPercent, &gMv, &gMa, &gTenths)) {
++		bool gExt = false, gChg = false, gDone = false;
++		(void)rain_charger(&gExt, &gChg, &gDone);
++		publish(gDone ? 100 : gPercent, gMv, gMa, gExt, gExt, gChg, gDone, true, true);
 +		return;
 +	}
  	if (fReal) {
