@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 01:30:00 +0100
+Subject: [PATCH] rain-0999: move the modem/DSP pool out of kernel RAM
+
+topaz's 16 MB pool for PAS metadata, SCM arguments and rings sat at
+0xE0000000, which the 2 GiB ADT gives the kernel (0xC0000000 +
+0x80000000). With adsp=1 the pool was mapped over pages the VM owned:
+pmap_assert_free "Found at least one mapping to 0xe0000000 ... Kernel
+CPU mapping". The GPU pool gives up its last 64 MB chunks (0x2c000000)
+and the modem pool moves to 0xBC000000.
+---
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index dabf22a..3fe96b6 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -165,7 +165,7 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+  * 0xC0000000 bank (mkadt.py --midmem with MIDBASE=0xc0000000 MIDSIZE=0x80000000); topaz's 1 GB
+  * ran into it (pmap_enter_pv: unexpected PV head on a managed page).
+  */
+-#define GPU_POOL_SIZE       0x30000000ull
++#define GPU_POOL_SIZE       0x2c000000ull       /* rain: 11 chunks; 0xbc000000.. is the modem/DSP pool (TopazModem) */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
+ #define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 15dcc41..81a7122 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -44,7 +44,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+ /* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++#define MODEM_POOL_BASE     0xBC000000ull       /* rain: 0xE0000000 is kernel RAM with the 2 GiB ADT (pmap_assert_free panic); top of the old GPU pool instead */
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+ #define SMEM_PA             0x46000000ull
