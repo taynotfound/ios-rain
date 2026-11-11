@@ -3,8 +3,9 @@
 **Apple's XNU kernel and the iOS 16.7.16 userland of the iPhone X, booting on a Xiaomi Redmi 10C**
 (`rain`, Xiaomi ROM family `fog`; Qualcomm **SM6225 "khaje"** / Snapdragon 680, 720×1650 panel, 4 GB RAM).
 
-As of **2026-11-08** the phone boots to the **iOS lock screen**. Touch does not work yet, so that is
-as far as you can get. This is an experiment, not a usable phone OS.
+As of **2026-11-11** the phone boots to the **iOS lock screen and home screen with working touch**
+and volume/lock keys. Drawing is done by the CPU on one core, so it is slow. This is an experiment,
+not a usable phone OS.
 
 > It installs into the `userdata` partition and so **erases Android's user data**. Nothing is flashed
 > to the boot partitions: the kernel is started from RAM with `fastboot boot`.
@@ -39,8 +40,8 @@ values in the shim and `tools/mkadt.py`, `build-rain/`, and the porting log
 | Storage | Works. UFS at `0x4804000`; the iOS root is an HFS+ volume in `userdata` |
 | iOS userland | Works. iPhone X 16.7.16 (20H392) root; reaches the lock screen. The first boot sat on the Apple logo for over 10 minutes |
 | Display | Works with `sweetfb_noshadow=1 sweetfb_fit=1`: the 1125×2436 iPhone X canvas is scaled to 720×1559 with bars above and below. With the shadow buffers on, the kernel hangs (open) |
-| Touch | **Not yet.** Novatek NT36525B over SPI. The SPI link works and the chip ID reads back; the firmware upload is being debugged. See the log |
-| Keys | Presses are noticed, nothing visible happens |
+| Touch | Works (patches 0962–0983). Novatek NT36525B over SPI through GPI DMA; the driver uploads Xiaomi's firmware at boot and again whenever the chip loses it (it is also the display driver, and a panel reset wipes it) |
+| Keys | Volume and lock keys work |
 | Audio, Wi-Fi | Untested on this phone. Audio needs a driver for the Awinic AW87xxx speaker amplifier |
 | Cellular, Bluetooth, camera, sensors | Not planned / not started |
 
