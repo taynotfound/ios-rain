@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 01:15:00 +0100
+Subject: [PATCH] rain-0998: SH366101 read byte by byte; rain's ADSP carveout
+
+The gauge's 2-byte reads returned a wrong second byte (soc 0x125e, mV
+0x00eb, temperature 0x018d): each register byte is now read on its own.
+rain's ADSP image spans 0x53800000..0x56600000 (DT pil_adsp_region size
+0x2e00000), larger than topaz's 0x2300000, so the loader refused it.
+---
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index d90bb1b..56f54a4 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -434,7 +434,8 @@ rain_gauge(unsigned *percent, unsigned *mv, int *ma, int *tenthsC)
+ 	uint16_t v[4];
+ 	static const uint8_t regs[4] = { 0x2c, 0x08, 0x0c, 0x06 };
+ 	for (int i = 0; i < 4; i++) {
+-		if (sweet_i2c_bus_read(1, 0x55, regs[i], w, 2)) {
++		/* byte by byte: in one 2-byte read the second byte came back wrong (0x08 gave 00eb for 4331 mV) */
++		if (sweet_i2c_bus_read(1, 0x55, regs[i], &w[0], 1) || sweet_i2c_bus_read(1, 0x55, regs[i] + 1, &w[1], 1)) {
+ 			return false;
+ 		}
+ 		v[i] = (uint16_t)(w[0] | w[1] << 8);
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index cbea497..9117aee 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -37,7 +37,7 @@ extern "C" bool     topaz_part_fw_read(const char *path, uint64_t off, void *dst
+ #define ADSP_PID            2                   /* SMEM host / SMP2P / GLINK remote pid */
+ #define ADSP_PAS_ID         1
+ #define ADSP_CARVE_PA       0x53800000u         /* DT pil_adsp_region */
+-#define ADSP_CARVE_SIZE     0x02300000u
++#define ADSP_CARVE_SIZE     0x02e00000u         /* rain DT pil_adsp_region (topaz: 0x2300000) */
+ #define ITEM_SMP2P_OUT      429                 /* apps -> adsp (DT qcom,smem = <443 429>: in, out) */
+ #define ITEM_SMP2P_IN       443                 /* adsp -> apps */
+ #define ITEM_ADSP_CRASH     423
