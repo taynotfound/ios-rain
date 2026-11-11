@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Wed, 11 Nov 2026 21:40:00 +0100
+Subject: [PATCH] rain-0989: vol+ + vol- = fastboot; read-only I2C scan of SE1/SE2
+
+With iOS in boot_a the phone always boots iOS and the fastboot key combo
+is hard to hit. Holding volume up and volume down 3 s now asks ABL for
+fastboot the way Xiaomi's kernel does (DT store-hard-reset-reason: PON
+SOFT_RB_SPARE bits 7:1 = 2, through the SPMI owner channel) and resets.
+raini2cscan=1 lists which addresses answer on QUP0 SE1 and SE2 (the
+SM5602 gauge is not at topaz's SE1 0x71 on rain).
+---
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index 8037ad6..68d34f2 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -11,6 +11,7 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_i2c1_init(void);
+@@ -51,6 +52,8 @@ int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
+ 
+ static vm_offset_t i2c1_se, i2c1_gcc, i2c1_west;
+ static bool i2c1_ready;
++static int i2c1_engine(void);
++static void sweet_i2c_scan(void);
+ static LCK_GRP_DECLARE(sweet_i2c1_grp, "sweet_i2c1");
+ static LCK_MTX_DECLARE(sweet_i2c1_lock, &sweet_i2c1_grp);
+ 
+@@ -194,7 +197,7 @@ sweet_i2c1_init(void)
+ 		return 0;
+ 	}
+ 	i2c1_gcc = ml_io_map(I2C1_GCC_PA, 0x80000);
+-	i2c1_west = ml_io_map(I2C1_WEST_PA, 0x6000);
++	i2c1_west = ml_io_map(I2C1_WEST_PA, 0x8000);   /* rain: up to GPIO7 for the SE2 scan */
+ 	i2c1_se = ml_io_map(I2C1_SE_PA, 0x4000);
+ 	if (!i2c1_gcc || !i2c1_west || !i2c1_se) {
+ 		return ENOMEM;
+@@ -209,9 +212,26 @@ sweet_i2c1_init(void)
+ 	wr(i2c1_west, 0x4000, (rd(i2c1_west, 0x4000) & ~0x3ffu) | 0x4u);
+ 	wr(i2c1_west, 0x5000, (rd(i2c1_west, 0x5000) & ~0x3ffu) | 0x4u);
+ 
++	int e = i2c1_engine();
++	if (e) {
++		return e;
++	}
++	i2c1_ready = true;
++	printf("SWEET I2C1: SE1 ready (fw %#x vote %#x)\n", rd(i2c1_se, SE_FW), rd(i2c1_gcc, I2C1_GCC_VOTE));
++	uint32_t scan = 0;
++	if (PE_parse_boot_argn("raini2cscan", &scan, sizeof(scan)) && scan) {
++		sweet_i2c_scan();
++	}
++	return 0;
++}
++
++/* GENI I2C engine set-up on i2c1_se (clocks and pins already on). */
++static int
++i2c1_engine(void)
++{
+ 	uint32_t fw = rd(i2c1_se, SE_FW), rxp = rd(i2c1_se, SE_HW_RX);
+ 	if (((fw >> 8) & 0xffu) != 3u || (rd(i2c1_se, SE_STATUS) & 0x1001u)) {
+-		printf("SWEET I2C1: SE1 not an idle I2C engine (fw %#x status %#x)\n",
++		printf("SWEET I2C1: not an idle I2C engine (fw %#x status %#x)\n",
+ 		    fw, rd(i2c1_se, SE_STATUS));
+ 		return EIO;
+ 	}
+@@ -237,8 +257,62 @@ sweet_i2c1_init(void)
+ 	wr(i2c1_se, 0x810, 0);
+ 	wr(i2c1_se, 0x814, ((rxp >> 16) & 0x3fu) - 1u);
+ 	wr(i2c1_se, SE_IRQ_EN, SE_DONE | SE_ERRORS | (3u << 26) | SE_TX_WM_IRQ);
+-	i2c1_ready = true;
+-	printf("SWEET I2C1: SE1 ready (fw %#x vote %#x)\n", fw, rd(i2c1_gcc, I2C1_GCC_VOTE));
+ 	return 0;
+ }
++
++/*
++ * rain (boot-arg raini2cscan=1): which addresses answer on QUP0 SE1 (gpio4/5) and SE2
++ * (gpio6/7, DT: smb1351 charger 0x55, fusb303 0x21, wusb3801 0x60)? Read-only: one
++ * register-0 read per address. The fuel gauge is not at topaz's SE1 0x71 here.
++ */
++static void
++i2c_scan_bus(const char *name)
++{
++	char line[256];
++	unsigned n = 0, len = 0;
++	line[0] = 0;
++	for (uint8_t a = 0x08; a < 0x78; a++) {
++		uint8_t b = 0;
++		lck_mtx_lock(&sweet_i2c1_lock);
++		uint8_t reg = 0;
++		int err = i2c1_msg(a, &reg, 1, NULL, 0, true);
++		if (!err) {
++			err = i2c1_msg(a, NULL, 0, &b, 1, false);
++		}
++		lck_mtx_unlock(&sweet_i2c1_lock);
++		if (!err && len + 8 < sizeof(line)) {
++			len += (unsigned)snprintf(line + len, sizeof(line) - len, " %02x(%02x)", a, b);
++			n++;
++		}
++	}
++	printf("RAIN I2C: %s: %u answer:%s\n", name, n, line);
++}
++
++static void
++sweet_i2c_scan(void)
++{
++	i2c_scan_bus("SE1 gpio4/5");
++	vm_offset_t se1 = i2c1_se, se2 = ml_io_map(0x04a88000u, 0x4000);
++	if (!se2) {
++		return;
++	}
++	wr(i2c1_gcc, I2C1_GCC_VOTE, rd(i2c1_gcc, I2C1_GCC_VOTE) | (1u << 12));      /* qupv3_wrap0_s2 (gcc-khaje.c) */
++	if (!wait_clear(i2c1_gcc, 0x1f3a4u, 1u << 31)) {
++		printf("RAIN I2C: SE2 clock off (cbcr %#x)\n", rd(i2c1_gcc, 0x1f3a4u));
++		return;
++	}
++	/* GPIO6/7: function 1 (qup2), 2 mA, no pull */
++	wr(i2c1_west, 0x6000, (rd(i2c1_west, 0x6000) & ~0x3ffu) | 0x4u);
++	wr(i2c1_west, 0x7000, (rd(i2c1_west, 0x7000) & ~0x3ffu) | 0x4u);
++	lck_mtx_lock(&sweet_i2c1_lock);
++	i2c1_se = se2;
++	int e = i2c1_engine();
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	if (!e) {
++		i2c_scan_bus("SE2 gpio6/7");
++	}
++	lck_mtx_lock(&sweet_i2c1_lock);
++	i2c1_se = se1;
++	lck_mtx_unlock(&sweet_i2c1_lock);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..1f719d0 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -24,6 +24,8 @@ void sweet_keys_init(void);
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_RT     0xc410u
+ #define KEYS_NO_APID     0xffffu
++#define KEYS_CHNLS_PA    0x01e00000u    /* rain DT spmi "chnls": owner (EE 0) read/write channels */
++#define KEYS_PON_SPARE   0x088fu        /* PON SOFT_RB_SPARE: restart reason in bits 7:1 (qpnp-power-on.c, gen2) */
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+@@ -82,6 +84,56 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/*
++ * rain: Volume up + Volume down held 3 s = reboot into fastboot, even with iOS hung.
++ * Xiaomi's kernel asks ABL for fastboot through the PMIC (DT qcom,store-hard-reset-reason:
++ * PON SOFT_RB_SPARE = PON_RESTART_REASON_BOOTLOADER << 1), not the IMEM cookie alone.
++ */
++static vm_offset_t keys_chnls;
++
++static bool
++keys_write(uint16_t apid, uint16_t addr, uint8_t val)
++{
++	if (apid == KEYS_NO_APID || !keys_chnls) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;
++	*(volatile uint32_t *)(keys_chnls + off + 0x10u) = val;                /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(keys_chnls + off) = (uint32_t)(addr & 0xffu) << 4;      /* EXT_WRITEL, one byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = keys_rd(keys_chnls, off + 0x08u);
++		if (st & 1u) {
++			return !(st & 0x0eu);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++keys_reboot_fastboot(void)
++{
++	uint8_t was = 0, now = 0;
++	bool r = keys_read(keys_pon_apid, KEYS_PON_SPARE, &was);
++	bool w = r && keys_write(keys_pon_apid, KEYS_PON_SPARE, (uint8_t)((was & 1u) | (2u << 1)));
++	bool c = keys_read(keys_pon_apid, KEYS_PON_SPARE, &now);
++	printf("RAIN KEYS: vol+ and vol- held: rebooting to fastboot (PON spare %#x -> %#x, read %d write %d check %d)\n",
++	    was, now, r, w, c);
++	vm_offset_t imem = ml_io_map(0x0c125000u, 0x1000);     /* restart_reason cookie as well */
++	if (imem) {
++		*(volatile uint32_t *)(imem + 0x65cu) = 0x77665500u;
++	}
++	delay(200000);          /* the USB log gets the line out */
++	__asm__ volatile("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009u;      /* PSCI SYSTEM_RESET */
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -95,7 +147,7 @@ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	unsigned errors = 0, both = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -119,6 +171,10 @@ keys_thread(void *arg, wait_result_t result)
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		both = (state[1] && state[2]) ? both + 1 : 0;
++		if (both == 150) {             /* 150 x 20 ms */
++			keys_reboot_fastboot();
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -140,6 +196,7 @@ sweet_keys_init(void)
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
++	keys_chnls = ml_io_map(KEYS_CHNLS_PA, 0x10000);
+ 	if (!keys_core || !keys_cnfg || !keys_obs) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
