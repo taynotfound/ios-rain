@@ -15,6 +15,10 @@ python3 tools/mkpayload.py "xnu/out-$N/kernel.development.sweet" build-rain/rain
   --cmdline "-v debug=0xc serial=3 cpus=1 keepsyms=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetchg=0 sweetfb_noshadow=1 sweetfb_fit=1 raintouch=1 sweettouchdelay=0 raintouchpause=0 $4" >/dev/null
 PATH=$P/build-rain/bin:$PATH MKBOOTIMG=mkbootimg bash shim/build.sh "$P/build-rain/payload-$T.bin" >/dev/null 2>&1
 cp shim/out/shim-boot.img "build-rain/shim-xnu-rain-touch$T.img"
-echo "waiting for fastboot $(date +%T)"
-ok=0; until [ $ok -ge 2 ]; do if timeout 3 fastboot getvar product 2>&1 | grep -q 'product: rain'; then ok=$((ok+1)); else ok=0; fi; sleep 1; done
-fastboot boot "build-rain/shim-xnu-rain-touch$T.img" && echo "booted $(date +%T)"
+# Xiaomi's ABL stops taking data after idling in fastboot: time the transfer out and wait for a fresh session
+until
+  echo "waiting for fastboot $(date +%T)"
+  ok=0; until [ $ok -ge 2 ]; do if timeout 3 fastboot getvar product 2>&1 | grep -q 'product: rain'; then ok=$((ok+1)); else ok=0; fi; sleep 1; done
+  timeout 30 fastboot boot "build-rain/shim-xnu-rain-touch$T.img"
+do echo "transfer hung: re-enter fastboot (Vol- + Power) $(date +%T)"; sleep 5; done
+echo "booted $(date +%T)"
