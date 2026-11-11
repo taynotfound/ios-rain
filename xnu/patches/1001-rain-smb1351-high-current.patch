@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 02:00:00 +0100
+Subject: [PATCH] rain-1001: SMB1351 to 2 A high-current mode
+
+Without Android's driver the SMB1351 stays at its USB default, less than
+iOS draws with the panel on: the phone ran flat on a fast charger. As
+smb1351_set_usb_chg_current() does for a wall charger: volatile config
+access, 0x00 = 0x5a (2000 mA input, 2000 mA fast charge), 0x31 command
+mode + HC. Re-applied when the volatile config was lost (unplug). Adds
+sweet_i2c_bus_write() for bus 2.
+---
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index af69c5c..5a62eab 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -350,6 +350,30 @@ sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned le
+ 	return err;
+ }
+ 
++/* a register write on bus 1 (SE1) or 2 (SE2) */
++int sweet_i2c_bus_write(int bus, uint8_t addr, uint8_t reg, uint8_t val);
++int
++sweet_i2c_bus_write(int bus, uint8_t addr, uint8_t reg, uint8_t val)
++{
++	if (bus == 1) {
++		return sweet_i2c1_write(addr, reg, val);
++	}
++	if (bus != 2 || !i2c1_ready) {
++		return ENXIO;
++	}
++	uint8_t tx[2] = { reg, val };
++	lck_mtx_lock(&sweet_i2c1_lock);
++	int err = ENXIO;
++	if (i2c2_up_locked()) {
++		vm_offset_t se1 = i2c1_se;
++		i2c1_se = i2c2_se;
++		err = i2c1_msg(addr, tx, 2, NULL, 0, false);
++		i2c1_se = se1;
++	}
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
+ static void
+ sweet_i2c_scan(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9820f28..c13a7a4 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -21,6 +21,36 @@ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+ extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ extern "C" int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
+ extern "C" int sweet_i2c_bus_read(int bus, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
++extern "C" int sweet_i2c_bus_write(int bus, uint8_t addr, uint8_t reg, uint8_t val);
++
++/*
++ * rain: without Android's smb1351 driver the charger stays in its USB default (~500 mA), less
++ * than iOS draws with the panel on: the phone ran flat on a fast charger. Do what
++ * smb1351_set_usb_chg_current() does for a wall charger: volatile config access (0x30 bit 6),
++ * input limit and fast-charge current in 0x00 (2000 mA: usb_chg_current[10], fast_chg_current[5]),
++ * then high-current mode by command (0x31: CMD mode, AC/HC). The chip's own thermal monitor and
++ * safety timer stay on. The config is volatile (lost on unplug), so it is checked every poll.
++ */
++static void
++rain_charger_setup(void)
++{
++	uint8_t r00 = 0, r31 = 0, r30 = 0;
++	if (sweet_i2c_bus_read(2, 0x55, 0x00, &r00, 1) || sweet_i2c_bus_read(2, 0x55, 0x31, &r31, 1) ||
++	    sweet_i2c_bus_read(2, 0x55, 0x30, &r30, 1)) {
++		return;
++	}
++	const uint8_t want00 = 0x5a, want31 = (uint8_t)((r31 & ~0x0fu) | 0x09u);
++	if (r00 == want00 && r31 == want31) {
++		return;
++	}
++	(void)sweet_i2c_bus_write(2, 0x55, 0x30, (uint8_t)(r30 | 0x40u));
++	(void)sweet_i2c_bus_write(2, 0x55, 0x00, want00);
++	(void)sweet_i2c_bus_write(2, 0x55, 0x31, want31);
++	uint8_t n00 = 0, n31 = 0;
++	(void)sweet_i2c_bus_read(2, 0x55, 0x00, &n00, 1);
++	(void)sweet_i2c_bus_read(2, 0x55, 0x31, &n31, 1);
++	IOLog("SWEET BATTERY: smb1351 set to 2 A: 0x00 %02x -> %02x, 0x31 %02x -> %02x\n", r00, n00, r31, n31);
++}
+ 
+ /*
+  * rain: the SM5602 gauge (Xiaomi's fog kernel uses sm5602_fg) does not answer on SE1 as on topaz.
+@@ -38,6 +68,7 @@ static bool
+ rain_charger(bool *external, bool *charging, bool *done)
+ {
+ 	uint8_t st4 = 0, irqe = 0;
++	rain_charger_setup();
+ 	if (sweet_i2c_bus_read(2, 0x55, 0x3a, &st4, 1) || sweet_i2c_bus_read(2, 0x55, 0x44, &irqe, 1)) {
+ 		return false;
+ 	}
