@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 12:45:00 +0100
+Subject: [PATCH] rain-1005: say when the ADSP sensor service appears
+
+The accelerometer hangs off the ADSP sensor hub. One log line when QMI
+service 400 (sns client) is announced: it tells whether the sensor
+protection domain starts without a registry file server.
+---
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 485bcc1..7e6337f 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1067,6 +1067,10 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		q_services++;
+ 		LOG("t=%u.%03u ADSP service %x v%u inst %x node %u port %x", T, c.a, c.b & 0xFF, c.b >> 8, c.c, c.d);
++		if (c.a == 400) {
++			/* rain: the accelerometer is behind this (QMI "sns client", protobuf requests); see docs/SENSORS-rain.md */
++			LOG("t=%u.%03u *** ADSP sensor client service (400) is up: node %u port %x ***", T, c.c, c.d);
++		}
+ 		break;
+ 	case QRTR_TYPE_NEW_LOOKUP:
+ 		q_lookups++;

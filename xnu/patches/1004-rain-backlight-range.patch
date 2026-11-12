@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 12:30:00 +0100
+Subject: [PATCH] rain-1004: panel brightness range from boot-args
+
+The DCS 0x51 range of rain's panels is not measured yet. rainbl_max
+(default 0x7ff as on topaz), rainbl_min (default max/64, so the slider
+cannot black the screen out) and rainbl_level=N (send N once at start,
+to find the range by eye). The level after a wake is 40 % of the range
+instead of topaz's 0x133. The slider itself still needs sweetbl=1.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ae9b25e..01c34e9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -251,7 +251,8 @@ public:
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+-	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
++	uint32_t      fBlLevel;       /* panel DBV fBlMin..fBlMax, kept while the display is off */
++	uint32_t      fBlMax, fBlMin; /* rain: boot-args rainbl_max / rainbl_min */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+@@ -399,11 +400,35 @@ AppleCLCD::start(IOService *provider)
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+-	fBlLevel = 0x133;                       /* panel init level (stock DT) */
++	/*
++	 * rain: the panel's brightness range is not known yet (three possible panels, DCS 0x51
++	 * with two bytes). rainbl_max=N: the level that means full brightness (0x7ff as on topaz
++	 * until measured: if the panel takes 12 bits, 0xfff is twice as bright; too high a value
++	 * wraps to dark on an 11-bit panel). rainbl_min=N: the lowest level sent while the display
++	 * is on, so the slider cannot make the screen unreadable. rainbl_level=N: send N once at
++	 * start, to find the range by eye without iOS.
++	 */
++	fBlMax = 0x7ff;
++	(void)PE_parse_boot_argn("rainbl_max", &fBlMax, sizeof(fBlMax));
++	if (fBlMax < 0xff || fBlMax > 0xffff) {
++		fBlMax = 0x7ff;
++	}
++	fBlMin = fBlMax / 64;
++	(void)PE_parse_boot_argn("rainbl_min", &fBlMin, sizeof(fBlMin));
++	if (fBlMin < 1 || fBlMin > fBlMax) {
++		fBlMin = 1;
++	}
++	fBlLevel = fBlMax * 2 / 5;              /* 200 of SWEET_FB_MAX_NITS, what IOMFBBrightnessLevel starts at */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+-		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
++		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51, levels %#x..%#x\n", *(volatile uint32_t *)(fDsi + 0x004),
++		    fBlMin, fBlMax);
++		uint32_t once = 0;
++		if (PE_parse_boot_argn("rainbl_level", &once, sizeof(once)) && once != 0 && fBlCall != NULL) {
++			fBlLevel = once & 0xffff;
++			thread_call_enter(fBlCall);
++		}
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+@@ -1222,13 +1247,13 @@ AppleCLCD::setProperties(OSObject *properties)
+ 	}
+ 	uint64_t v = n->unsigned64BitValue();
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
+-	/* 0..SWEET_FB_MAX_NITS nits -> DBV 1..0x7ff */
+-	uint64_t level = (v * 0x7ffull) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
+-	if (level > 0x7ff) {
+-		level = 0x7ff;
++	/* 0..SWEET_FB_MAX_NITS nits -> DBV fBlMin..fBlMax */
++	uint64_t level = (v * (uint64_t)fBlMax) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
++	if (level > fBlMax) {
++		level = fBlMax;
+ 	}
+-	if (level < 1) {
+-		level = 1;
++	if (level < fBlMin) {
++		level = fBlMin;
+ 	}
+ 	IOLockLock(fLock);
+ 	fBlLevel = (uint32_t)level;

@@ -1,0 +1,601 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Thu, 12 Nov 2026 12:00:00 +0100
+Subject: [PATCH] rain-1003: sound through the ADSP's APR/Elite services
+
+rain's ADSP firmware has no GPR/AudioReach (adsp_apps), only apr_audio_svc.
+TopazAudio now also speaks APR: core state, AFE core votes and TX core
+clocks instead of PRM, AFE port RX_CODEC_DMA_RX_1, one ADM COPP, one ASM
+PCM stream fed with 20 ms buffers from the ring iOS writes into. Codec,
+SoundWire and the AW87390 amp are unchanged. adsp_tone=N plays a tone
+through the same path. The stand-in /dev/redwood-audio stays only
+without adsp=1. Untested on the phone.
+---
+diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+index 9936b90..606d8a9 100644
+--- a/bsd/dev/rain_haptic.c
++++ b/bsd/dev/rain_haptic.c
+@@ -162,9 +162,12 @@ rain_haptic_init(void)
+ 	int major = cdevsw_add(-1, &haptic_cdevsw);
+ 	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
+ 	printf("RAIN HAPTIC: /dev/redwood-haptic %s (gpio36 ctl %#x)\n", node ? "ready" : "failed", *(volatile uint32_t *)hg);
+-	int amajor = cdevsw_add(-1, &astub_cdevsw);
+-	void *anode = amajor < 0 ? NULL : devfs_make_node(makedev(amajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
+-	printf("RAIN AUDIO: stand-in /dev/redwood-audio %s\n", anode ? "ready" : "failed");
++	uint32_t adsp = 0;                                /* adsp=1: TopazAudio makes the real /dev/redwood-audio */
++	if (!PE_parse_boot_argn("adsp", &adsp, sizeof(adsp)) || adsp == 0) {
++		int amajor = cdevsw_add(-1, &astub_cdevsw);
++		void *anode = amajor < 0 ? NULL : devfs_make_node(makedev(amajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++		printf("RAIN AUDIO: stand-in /dev/redwood-audio %s\n", anode ? "ready" : "failed");
++	}
+ 	uint32_t buzz = 0;                                /* boot-arg rainbuzz=1: one 300 ms buzz, to test */
+ 	if (PE_parse_boot_argn("rainbuzz", &buzz, sizeof(buzz)) && buzz && node) {
+ 		uint64_t deadline;
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 9117aee..485bcc1 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1391,6 +1391,9 @@ static bool codec_up, ports_up, amp_init;
+  * macros, both SoundWire masters with the codec in reset, SMMU identity for the audio DMA
+  * stream 0x1C1, the stock RX macro registers, WCD937x init + AUX DAC.
+  */
++static bool apr_mode;                           /* rain: Elite/APR firmware (apr_audio_svc), not GPR */
++static bool apr_clocks(void);
++
+ static bool
+ codec_bringup(void)
+ {
+@@ -1411,13 +1414,13 @@ codec_bringup(void)
+ 	}
+ 	/* 1. PRM: DCODEC HW vote, TX core + TX NPL clocks 19.2 MHz */
+ 	dw[0] = 2; dw[1] = 0x08001032; dw[2] = 4; dw[3] = 0; dw[4] = 2;
+-	ok = prm(dw, 5);
+-	for (uint32_t i = 0; i < 2 && ok; i++) {
++	ok = apr_mode ? apr_clocks() : prm(dw, 5);
++	for (uint32_t i = 0; i < 2 && ok && !apr_mode; i++) {
+ 		dw[0] = 2; dw[1] = 0x0800102C; dw[2] = 20; dw[3] = 0; dw[4] = 1;
+ 		dw[5] = 0x30C + i; dw[6] = 19200000; dw[7] = 1; dw[8] = 0;
+ 		ok = prm(dw, 9);
+ 	}
+-	LOG("t=%u.%03u PRM vote + clocks: %s", T, ok ? "OK" : "FAILED");
++	LOG("t=%u.%03u %s vote + clocks: %s", T, apr_mode ? "AFE" : "PRM", ok ? "OK" : "FAILED");
+ 	if (!ok) {
+ 		return false;
+ 	}
+@@ -1669,7 +1672,7 @@ tone_test(unsigned seconds)
+  * loudest (boot-arg adsp_vol, dB of the RX2 digital gain).
+  */
+ #define RING_BYTES          (48000u * 4)
+-#define LEAD_BYTES          (48u * 4 * 40)          /* 40 ms ahead of the DSP */
++static uint32_t lead_bytes = 48u * 4 * 40;      /* 40 ms ahead of the DSP (APR: 80 ms ahead of our read offset) */
+ #define QUIET_MS            500
+ 
+ static uint8_t *ring;
+@@ -1684,6 +1687,390 @@ static uint64_t frames_in, frames_dropped, underruns;
+ static IOLock *stream_lock;
+ static bool stream_wake_flag;
+ 
++extern "C" uint32_t topaz_audio_write(const int16_t *frames, uint32_t count);
++
++/* ---------------------------------------------------------------- rain: APR / Elite instead of GPR / AudioReach */
++
++/*
++ * rain's ADSP firmware is the older "Elite" audio stack: no adsp_apps (GPR) channel, but
++ * apr_audio_svc with the services AFE (ports, clocks), ADM (device mixer) and ASM (streams).
++ * Structures and opcodes: Linux sound/soc/qcom/qdsp6/q6afe.c, q6adm.c, q6asm.c, q6core.c.
++ * The chain for the speaker, the same hardware path as the AudioReach graph above:
++ *   AFE: LPASS core votes + TX core / NPL clocks (the PRM calls), port RX_CODEC_DMA_RX_1
++ *   ADM: one COPP on that port, no post-processing
++ *   ASM: session 1 stream 1, 48 kHz 16-bit stereo PCM, routed to the COPP
++ * The DSP does not pull a ring here: the audio thread hands it 20 ms buffers
++ * (ASM_DATA_CMD_WRITE_V2) cut from the same ring iOS writes into, two at a time, and the
++ * read offset the writer looks at (pos_buf[1]) is ours.
++ */
++#define ACHAN               "apr_audio_svc"
++#define APR_DOM_ADSP        4
++#define APR_DOM_APPS        5
++#define APR_SVC_CORE        3
++#define APR_SVC_AFE         4
++#define APR_SVC_ASM         7
++#define APR_SVC_ADM         8
++#define APR_BASIC_RSP       0x000110E8u
++#define AVCS_GET_STATE      0x0001290Cu
++#define AVCS_RSP_GET_STATE  0x0001290Du
++#define AFE_PORT_START      0x000100E5u
++#define AFE_PORT_STOP       0x000100E6u
++#define AFE_PORT_SET_PARAM  0x000100EFu
++#define AFE_SVC_SET_PARAM   0x000100F3u
++#define AFE_HW_VOTE         0x000100F4u
++#define AFE_RSP_HW_VOTE     0x000100F5u
++#define AFE_PORT_RX_DMA_1   0xB032u             /* RX_CODEC_DMA_RX_1: AIF2_PB -> RX2 -> AUX */
++#define ADM_DEVICE_OPEN     0x00010326u
++#define ADM_RSP_DEVICE_OPEN 0x00010329u
++#define ADM_DEVICE_CLOSE    0x00010327u
++#define ADM_MATRIX_MAP      0x00010325u
++#define ASM_MEM_MAP         0x00010D92u
++#define ASM_RSP_MEM_MAP     0x00010D93u
++#define ASM_OPEN_WRITE      0x00010DB3u
++#define ASM_MEDIA_FMT       0x00010D98u
++#define ASM_RUN             0x00010DAAu
++#define ASM_WRITE           0x00010DABu
++#define ASM_WRITE_DONE      0x00010D99u
++#define ASM_CLOSE           0x00010BCDu
++#define ASM_SESSION         1u
++#define ASM_PORT            ((ASM_SESSION << 8) | 1u)   /* session 1, stream 1 */
++#define APR_BUF_BYTES       (48u * 4 * 20)      /* 20 ms */
++#define APR_BUFS            2u
++
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t  src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t  dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
++
++static uint32_t avcs_state = 0xFFFFFFFFu, apr_asks, apr_rxn, apr_token = 0x200;
++static unsigned apr_last_ask;
++static uint8_t  acall_svc;
++static uint32_t acall_cmd, acall_rsp_op, acall_op, acall_status, acall_words, acall_rsp[8];
++static bool     acall_wait, acall_done;
++static uint32_t apr_addr_msw = 1;               /* SMMU stream bits of the audio DMA (0x1C1 & 0xF), as in mem_map() */
++static uint8_t *apr_bufs;
++static uint64_t apr_bufs_pa;
++static uint32_t apr_map, apr_copp, apr_free, apr_rd, apr_seq, apr_wdone, apr_wsent;
++static bool     apr_running;
++
++static void
++apr_send(uint8_t svc, uint16_t sport, uint16_t dport, uint32_t token, uint32_t opcode, const void *payload, uint32_t len)
++{
++	uint8_t buf[sizeof(struct apr_hdr) + 128];
++	struct apr_hdr *h = (struct apr_hdr *)buf;
++
++	if (len > 128) {
++		return;
++	}
++	bzero(buf, sizeof(buf));
++	h->hdr_field = (2u << 8) | ((sizeof(struct apr_hdr) / 4) << 4);         /* SEQ_CMD, header words, version 0 */
++	h->pkt_size = (uint16_t)(sizeof(struct apr_hdr) + len);
++	h->src_svc = svc;
++	h->src_domain = APR_DOM_APPS;
++	h->src_port = sport;
++	h->dest_svc = svc;
++	h->dest_domain = APR_DOM_ADSP;
++	h->dest_port = dport;
++	h->token = token;
++	h->opcode = opcode;
++	if (len != 0) {
++		memcpy(buf + sizeof(struct apr_hdr), payload, len);
++	}
++	glink_send(ACHAN, buf, (uint32_t)sizeof(struct apr_hdr) + len);
++}
++
++static void
++apr_rx(const uint8_t *data, uint32_t len)
++{
++	const struct apr_hdr *h = (const struct apr_hdr *)data;
++
++	apr_rxn++;
++	if (len < sizeof(struct apr_hdr)) {
++		LOG("t=%u.%03u apr: short packet %u B", T, len);
++		return;
++	}
++	uint32_t hlen = ((h->hdr_field >> 4) & 0xFu) * 4;
++	uint32_t words = len > hlen ? (len - hlen) / 4 : 0;
++	uint32_t p0 = 0, p1 = 0;
++	if (words >= 1) {
++		memcpy(&p0, data + hlen, 4);
++	}
++	if (words >= 2) {
++		memcpy(&p1, data + hlen + 4, 4);
++	}
++	if (h->opcode == AVCS_RSP_GET_STATE && words >= 1) {
++		if (p0 != avcs_state) {
++			LOG("t=%u.%03u *** APR core state = %u%s (after %u asks) ***", T, p0, p0 == 1 ? " READY" : "", apr_asks);
++		}
++		avcs_state = p0;
++		return;
++	}
++	if (h->opcode == ASM_WRITE_DONE) {
++		apr_wdone++;
++		if (apr_free < APR_BUFS) {
++			apr_free++;
++		}
++		return;
++	}
++	if (acall_wait && h->src_svc == acall_svc &&
++	    ((h->opcode == APR_BASIC_RSP && p0 == acall_cmd) || (acall_rsp_op != 0 && h->opcode == acall_rsp_op))) {
++		acall_op = h->opcode;
++		acall_status = h->opcode == APR_BASIC_RSP ? p1 : 0;
++		acall_words = MIN(words, (uint32_t)(sizeof(acall_rsp) / 4));
++		memcpy(acall_rsp, data + hlen, acall_words * 4);
++		acall_done = true;
++		return;
++	}
++	if (h->opcode == APR_BASIC_RSP && (p0 == AVCS_GET_STATE || p0 == ASM_WRITE)) {
++		if (p0 == ASM_WRITE && p1 != 0 && apr_rxn <= 64) {
++			LOG("t=%u.%03u apr: write refused, status %u", T, p1);
++		}
++		return;
++	}
++	if (apr_rxn <= 48) {
++		LOG("t=%u.%03u apr rx %u B: svc %u port %x->%x token %x opcode %08x payload %08x %08x", T, len, h->src_svc,
++		    h->src_port, h->dest_port, h->token, h->opcode, p0, p1);
++	}
++}
++
++/* one command, wait for APR_BASIC_RSP_RESULT of it or for rsp_op; true when the status is 0 */
++static bool
++apr_call(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, uint32_t rsp_op, const void *payload, uint32_t len)
++{
++	acall_svc = svc;
++	acall_cmd = opcode;
++	acall_rsp_op = rsp_op;
++	acall_done = false;
++	acall_status = 0;
++	acall_words = 0;
++	acall_wait = true;
++	apr_send(svc, port, port, apr_token++, opcode, payload, len);
++	for (unsigned t = ms(); !acall_done && ms() - t < 1000;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	acall_wait = false;
++	if (!acall_done) {
++		LOG("t=%u.%03u apr %s (%08x): no reply", T, what, opcode);
++		return false;
++	}
++	if (acall_status != 0 || (rsp_op != 0 && acall_op != rsp_op)) {
++		LOG("t=%u.%03u apr %s (%08x): reply %08x status %#x", T, what, opcode, acall_op, acall_status);
++		return false;
++	}
++	return true;
++}
++
++static void
++apr_poll(void)
++{
++	if (apr_mode || !glink_chan_up(ACHAN)) {
++		return;
++	}
++	if (avcs_state == 1 || apr_asks >= 15) {
++		/* some firmwares do not answer the state query: the open channel is taken as ready then */
++		LOG("t=%u.%03u APR audio on \"%s\" (core state %d after %u asks)", T, ACHAN, (int)avcs_state, apr_asks);
++		apr_mode = true;
++		return;
++	}
++	if (apr_asks == 0 || ms() - apr_last_ask >= 1000) {
++		apr_last_ask = ms();
++		apr_asks++;
++		apr_send(APR_SVC_CORE, 0, 0, apr_token++, AVCS_GET_STATE, NULL, 0);
++	}
++}
++
++/* the PRM requests of codec_bringup(), through AFE */
++static bool
++apr_clocks(void)
++{
++	bool ok = true;
++
++	(void)PE_parse_boot_argn("apr_msw", &apr_addr_msw, sizeof(apr_addr_msw));
++	for (uint32_t blk = 3; blk <= 4; blk++) {                /* LPASS core hardware: MACRO 3, DCODEC 4 */
++		struct { uint32_t hw_block_id; char client[8]; } __attribute__((packed)) vote = { blk, "rain" };
++		bool v = apr_call("core hw vote", APR_SVC_AFE, 0, AFE_HW_VOTE, AFE_RSP_HW_VOTE, &vote, sizeof(vote));
++		LOG("t=%u.%03u AFE core hw vote %u: %s (handle %#x)", T, blk, v ? "OK" : "FAILED", v && acall_words ? acall_rsp[0] : 0);
++	}
++	for (uint32_t i = 0; i < 2; i++) {                       /* TX core MCLK 0x30C, TX core NPL MCLK 0x30D */
++		struct {
++			uint32_t payload_size, addr_lsw, addr_msw, mem_map_handle;
++			uint32_t module_id, param_id;
++			uint16_t param_size, reserved;
++			uint32_t minor, clk_id, freq;
++			uint16_t attri, root;
++			uint32_t enable;
++		} __attribute__((packed)) c = { 12 + 20, 0, 0, 0, 0x0001028F, 0x00010290, 20, 0, 1, 0x30C + i, 19200000, 1, 0, 1 };
++		ok &= apr_call("clock", APR_SVC_AFE, 0, AFE_SVC_SET_PARAM, 0, &c, sizeof(c));
++	}
++	LOG("t=%u.%03u AFE clocks: %s", T, ok ? "OK" : "FAILED");
++	return ok;
++}
++
++static bool
++apr_stream_open(void)
++{
++	uint64_t pa = 0;
++	uint8_t *va = (uint8_t *)topaz_pool_alloc((APR_BUFS + 1) * 0x1000, &pa);
++
++	if (va == NULL) {
++		LOG("apr: no pool memory");
++		return false;
++	}
++	apr_bufs_pa = (pa + 0xFFF) & ~0xFFFull;                  /* one 4 KiB slot a buffer */
++	apr_bufs = va + (apr_bufs_pa - pa);
++	bzero(apr_bufs, APR_BUFS * 0x1000);
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, addr_lsw, addr_msw, bytes;
++	} __attribute__((packed)) map = { 3, 1, 0, (uint32_t)apr_bufs_pa, apr_addr_msw, APR_BUFS * 0x1000 };
++	if (!apr_call("mem map", APR_SVC_ASM, 0, ASM_MEM_MAP, ASM_RSP_MEM_MAP, &map, sizeof(map)) || acall_words < 1) {
++		return false;
++	}
++	apr_map = acall_rsp[0];
++	LOG("t=%u.%03u ASM buffers %#llx mapped, handle %#x", T, apr_bufs_pa, apr_map);
++	return true;
++}
++
++static bool
++apr_start(void)
++{
++	struct {
++		uint16_t port, payload_size;
++		uint32_t addr_lsw, addr_msw, mem_map_handle;
++		uint32_t module_id, param_id;
++		uint16_t param_size, reserved;
++		uint32_t minor, rate;
++		uint16_t bits, format, channels, mask;
++	} __attribute__((packed)) cfg = { AFE_PORT_RX_DMA_1, 12 + 16, 0, 0, 0, 0x0001020C, 0x000102B8, 16, 0, 1, 48000, 16, 0, 2, 3 };
++	struct { uint16_t port, reserved; } __attribute__((packed)) port = { AFE_PORT_RX_DMA_1, 0 };
++	struct {
++		uint16_t flags, mode, endpoint1, endpoint2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t  map[8];
++	} __attribute__((packed)) adm = { 0, 1, AFE_PORT_RX_DMA_1, 0, 0x00010312, 2, 16, 48000, { 1, 2 } };
++	struct { uint32_t mode; uint16_t sink, bits; uint32_t popp, format; } __attribute__((packed)) open =
++	    { 0, 0, 16, 0x00010C68, 0x00010DA5 };
++	struct {
++		uint32_t blk_size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t  map[8];
++	} __attribute__((packed)) fmt = { 20, 2, 16, 48000, 1, 0, { 1, 2 } };
++	struct { uint32_t matrix, sessions; uint16_t session, copps, copp, pad; } __attribute__((packed)) route =
++	    { 0, 1, ASM_SESSION, 1, 0, 0 };
++	struct { uint32_t flags, time_lsw, time_msw; } __attribute__((packed)) run = { 0, 0, 0 };
++
++	if (!apr_call("port config", APR_SVC_AFE, 0, AFE_PORT_SET_PARAM, 0, &cfg, sizeof(cfg)) ||
++	    !apr_call("port start", APR_SVC_AFE, 0, AFE_PORT_START, 0, &port, sizeof(port))) {
++		return false;
++	}
++	if (!apr_call("device open", APR_SVC_ADM, AFE_PORT_RX_DMA_1, ADM_DEVICE_OPEN, ADM_RSP_DEVICE_OPEN, &adm, sizeof(adm)) ||
++	    acall_words < 2 || acall_rsp[0] != 0) {
++		LOG("t=%u.%03u ADM open: status %#x", T, acall_words ? acall_rsp[0] : 0xFFFFFFFFu);
++		goto port_stop;
++	}
++	apr_copp = acall_rsp[1] & 0xFFFF;
++	route.copp = (uint16_t)apr_copp;
++	if (!apr_call("stream open", APR_SVC_ASM, ASM_PORT, ASM_OPEN_WRITE, 0, &open, sizeof(open))) {
++		goto adm_close;
++	}
++	if (!apr_call("media format", APR_SVC_ASM, ASM_PORT, ASM_MEDIA_FMT, 0, &fmt, sizeof(fmt)) ||
++	    !apr_call("routing", APR_SVC_ADM, 0, ADM_MATRIX_MAP, 0, &route, sizeof(route)) ||
++	    !apr_call("run", APR_SVC_ASM, ASM_PORT, ASM_RUN, 0, &run, sizeof(run))) {
++		(void)apr_call("stream close", APR_SVC_ASM, ASM_PORT, ASM_CLOSE, 0, NULL, 0);
++		goto adm_close;
++	}
++	apr_free = APR_BUFS;
++	apr_rd = 0;
++	pos_buf[1] = 0;
++	apr_running = true;
++	LOG("t=%u.%03u APR stream running (COPP %u)", T, apr_copp);
++	return true;
++adm_close:
++	(void)apr_call("device close", APR_SVC_ADM, (uint16_t)apr_copp, ADM_DEVICE_CLOSE, 0, NULL, 0);
++port_stop:
++	(void)apr_call("port stop", APR_SVC_AFE, 0, AFE_PORT_STOP, 0, &port, sizeof(port));
++	return false;
++}
++
++static void
++apr_stop(void)
++{
++	struct { uint16_t port, reserved; } __attribute__((packed)) port = { AFE_PORT_RX_DMA_1, 0 };
++
++	if (!apr_running) {
++		return;
++	}
++	apr_running = false;
++	(void)apr_call("stream close", APR_SVC_ASM, ASM_PORT, ASM_CLOSE, 0, NULL, 0);
++	(void)apr_call("device close", APR_SVC_ADM, (uint16_t)apr_copp, ADM_DEVICE_CLOSE, 0, NULL, 0);
++	(void)apr_call("port stop", APR_SVC_AFE, 0, AFE_PORT_STOP, 0, &port, sizeof(port));
++	LOG("t=%u.%03u APR stream closed (%u buffers sent, %u done)", T, apr_wsent, apr_wdone);
++}
++
++/* hand the DSP the next 20 ms of the ring whenever it has given a buffer back */
++static void
++apr_pump(void)
++{
++	while (apr_running && apr_free > 0) {
++		uint32_t slot = apr_seq % APR_BUFS;
++		uint8_t *dst = apr_bufs + slot * 0x1000;
++		uint32_t n1 = MIN(APR_BUF_BYTES, RING_BYTES - apr_rd);
++		struct { uint32_t addr_lsw, addr_msw, handle, bytes, seq, ts_lsw, ts_msw, flags; } __attribute__((packed)) w = {
++			(uint32_t)apr_bufs_pa + slot * 0x1000, apr_addr_msw, apr_map, APR_BUF_BYTES, apr_seq, 0, 0, 0
++		};
++
++		memcpy(dst, ring + apr_rd, n1);
++		memcpy(dst + n1, ring, APR_BUF_BYTES - n1);
++		mb();
++		apr_rd = (apr_rd + APR_BUF_BYTES) % RING_BYTES;
++		pos_buf[1] = apr_rd;
++		apr_free--;
++		apr_seq++;
++		apr_wsent++;
++		apr_send(APR_SVC_ASM, ASM_PORT, ASM_PORT, slot, ASM_WRITE, &w, sizeof(w));
++	}
++}
++
++/* boot-arg adsp_tone=N with APR: N seconds of 1 kHz through the same path iOS uses */
++static unsigned tone_end_ms;
++static uint64_t tone_frames;
++static unsigned tone_t0;
++
++static void
++apr_tone_feed(void)
++{
++	static const int16_t q[13] = { 0, 428, 848, 1253, 1638, 1997, 2317, 2604, 2838, 3020, 3165, 3240, 3277 };
++	int16_t buf[480 * 2];
++
++	if (tone_end_ms == 0) {
++		return;
++	}
++	if (ms() >= tone_end_ms) {
++		tone_end_ms = 0;
++		LOG("t=%u.%03u tone: done (%u buffers sent, %u done)", T, apr_wsent, apr_wdone);
++		return;
++	}
++	while (tone_frames < (uint64_t)(ms() - tone_t0) * 48 + 480) {
++		for (uint32_t f = 0; f < 480; f++) {
++			uint32_t k = (uint32_t)((tone_frames + f) % 48), a = k % 24;
++			int16_t v = a <= 12 ? q[a] : q[24 - a];
++			buf[2 * f] = buf[2 * f + 1] = k < 24 ? v : (int16_t)-v;
++		}
++		(void)topaz_audio_write(buf, 480);
++		tone_frames += 480;
++	}
++}
++
+ static bool
+ stream_open(void)
+ {
+@@ -1694,6 +2081,12 @@ stream_open(void)
+ 		LOG("stream: no memory");
+ 		return false;
+ 	}
++	if (apr_mode) {
++		lead_bytes = 48u * 4 * 80;
++		bzero(ring, RING_BYTES);
++		stream_ready = apr_stream_open();
++		return stream_ready;
++	}
+ 	stream_ready = graph_open(ring_pa, RING_BYTES, pos_pa);
+ 	return stream_ready;
+ }
+@@ -1712,12 +2105,25 @@ apply_volume(void)
+ static void
+ stream_start(void)
+ {
+-	if (stream_ran) {
+-		(void)sg_cmd(APM_GRAPH_PREPARE);
+-	}
+-	if (!sg_cmd(APM_GRAPH_START)) {
+-		LOG("stream: start failed");
+-		return;
++	if (apr_mode) {
++		static unsigned failed;
++		if (!apr_start()) {
++			last_write = 0;                         /* not again before iOS writes more */
++			if (++failed >= 3) {
++				stream_ready = false;
++			}
++			LOG("stream: APR start failed%s", stream_ready ? "" : " three times: sound is off");
++			return;
++		}
++		failed = 0;
++	} else {
++		if (stream_ran) {
++			(void)sg_cmd(APM_GRAPH_PREPARE);
++		}
++		if (!sg_cmd(APM_GRAPH_START)) {
++			LOG("stream: start failed");
++			return;
++		}
+ 	}
+ 	stream_ran = true;
+ 	if (!ports_up) {
+@@ -1741,7 +2147,11 @@ stream_stop(void)
+ 	amp_on(false);
+ 	IOSleep(10);
+ 	lw(RX_MACRO + 0x500, 0x04);
+-	(void)sg_cmd(APM_GRAPH_STOP);
++	if (apr_mode) {
++		apr_stop();
++	} else {
++		(void)sg_cmd(APM_GRAPH_STOP);
++	}
+ 	bzero(ring, RING_BYTES);
+ 	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns)", T, frames_in, frames_dropped,
+ 	    underruns);
+@@ -1765,6 +2175,9 @@ stream_poll(void)
+ 	if (playing && vol_applied != vol_gen) {
+ 		apply_volume();
+ 	}
++	if (playing && apr_mode) {
++		apr_pump();
++	}
+ }
+ 
+ /* frames from /dev/topaz-audio: never waits; returns how many were taken */
+@@ -1783,8 +2196,8 @@ topaz_audio_write(const int16_t *frames, uint32_t count)
+ 		if (playing) {
+ 			underruns++;
+ 		}
+-		w = (r + LEAD_BYTES) % RING_BYTES;
+-		ahead = LEAD_BYTES;
++		w = (r + lead_bytes) % RING_BYTES;
++		ahead = lead_bytes;
+ 	}
+ 	if (ahead + bytes > RING_BYTES - 4096) {            /* too far ahead: drop the rest */
+ 		uint32_t room = RING_BYTES - 4096 > ahead ? (RING_BYTES - 4096 - ahead) & ~3u : 0;
+@@ -1795,7 +2208,7 @@ topaz_audio_write(const int16_t *frames, uint32_t count)
+ 	memcpy(ring + w, frames, n1);
+ 	memcpy(ring, (const uint8_t *)frames + n1, bytes - n1);
+ 	/* silence after the data: when iOS stops writing the DSP must not replay the ring (a click at the end) */
+-	uint32_t z = (w + bytes) % RING_BYTES, zl = 2 * LEAD_BYTES, z1 = MIN(zl, RING_BYTES - z);
++	uint32_t z = (w + bytes) % RING_BYTES, zl = 2 * lead_bytes, z1 = MIN(zl, RING_BYTES - z);
+ 	bzero(ring + z, z1);
+ 	bzero(ring, zl - z1);
+ 	mb();
+@@ -1939,21 +2352,30 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	glink_register(QCHAN, qrtr_rx);
+ 	glink_register(GCHAN, gpr_rx);
++	glink_register(ACHAN, apr_rx);
+ 	for (;;) {
+ 		bool busy = glink_poll();
+ 		qrtr_poll();
+ 		gpr_poll();
++		apr_poll();
++		apr_tone_feed();
+ 		stream_poll();
+-		if (spf_state == 1 && !codec_tried) {
++		if ((spf_state == 1 || apr_mode) && !codec_tried) {
+ 			uint32_t tone = 0;
+ 			codec_tried = true;
+ 			(void)PE_parse_boot_argn("adsp_vol", &vol_db, sizeof(vol_db));
+ 			if (codec_bringup()) {
+-				if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
++				bool want_tone = PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0;
++				if (want_tone && !apr_mode) {
+ 					tone_test(MIN(tone, 10u));
+ 				}
+ 				if (stream_open()) {
+ 					audio_dev_init();
++					if (want_tone && apr_mode) {
++						tone_t0 = ms();
++						tone_end_ms = tone_t0 + MIN(tone, 10u) * 1000;
++						LOG("t=%u.%03u tone: %u s at %d dB", T, MIN(tone, 10u), vol_db);
++					}
+ 				}
+ 			}
+ 		}
+@@ -1965,12 +2387,13 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (ms() - last_status >= 60000) {
+ 			last_status = ms();
+ 			LOG("t=%u.%03u status: slave-kernel %08x, qrtr node %x hello %u, %u services, %u lookups, pd-mapper %u, "
+-			    "SPF %d", T, *adsp_state, q_node, q_hello_rx, q_services, q_lookups, q_pdreqs, (int)spf_state);
++			    "SPF %d, APR %d (core %d, %u buffers, %u done)", T, *adsp_state, q_node, q_hello_rx, q_services, q_lookups, q_pdreqs,
++			    (int)spf_state, (int)apr_mode, (int)avcs_state, apr_wsent, apr_wdone);
+ 			glink_summary();
+ 		}
+ 		if (busy) {
+ 			IODelay(200);
+-		} else if (stream_ready && !playing) {
++		} else if (stream_ready && !playing && tone_end_ms == 0) {
+ 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
