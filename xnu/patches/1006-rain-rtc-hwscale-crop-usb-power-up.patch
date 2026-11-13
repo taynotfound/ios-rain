@@ -6,11 +6,12 @@ Subject: [PATCH] rain-1006: RTC clock, hardware scaler with crop, USB power-up
 Wall clock from the PM6125 RTC (SPMI 0x6048, read-only) plus boot-arg
 rtc_off; IORTC is published so IOKitInitializeTime does not wait 30 s.
 sweetfb_hwscale=1 now also serves fit=3 (crop in source columns). The
-SWEET FPS line says how much of a present waits for the GPU.
+SWEET FPS line says how much of a present waits for the GPU. SPMI
+observer at rain's addresses (sweet's hung the bus in clock init).
 sweetusb=3 powers the USB block up itself (RPM L12/L15, GDSC, clocks,
 femto PHY, DWC3 globals) for boots from boot_a.
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 1981490..c2ec624 100644
+index 1981490..7d81859 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -1,5 +1,5 @@
@@ -20,6 +21,19 @@ index 1981490..c2ec624 100644
   * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
   * No interrupt clear, peripheral enable, charger config, or PMIC writes.
   * Init is serialized by the single built-in SweetBattery personality.
+@@ -14,9 +14,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
++#define SP_CORE_PA 0x01c40000u     /* rain (SM6225, as sweet_keys.c); sweet had 0x0c440000 */
++#define SP_OBS_PA  0x03e00000u
++#define SP_CFG_PA  0x01c0a000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
 @@ -90,7 +90,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  	unsigned peripheral = addr >> 8;
  	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
