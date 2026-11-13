@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 01:00:00 +0100
+Subject: [PATCH] rain-1006: RTC clock, hardware scaler with crop, USB power-up
+
+Wall clock from the PM6125 RTC (SPMI 0x6048, read-only) plus boot-arg
+rtc_off; IORTC is published so IOKitInitializeTime does not wait 30 s.
+sweetfb_hwscale=1 now also serves fit=3 (crop in source columns). The
+SWEET FPS line says how much of a present waits for the GPU.
+sweetusb=3 powers the USB block up itself (RPM L12/L15, GDSC, clocks,
+femto PHY, DWC3 globals) for boots from boot_a.
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..c2ec624 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,5 +1,5 @@
+ /*
+- * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
++ * Battery (and, on rain, RTC) adaptation of input/sweet_keys.c, observer EXT_READL.
+  * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+@@ -90,7 +90,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {       /* 0x60: RTC (rain) */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0c72ffc..c167628 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -65,6 +65,7 @@ static const struct {
+ 
+ #define DWC3_PA                 0x04e00000
+ #define DWC3_SIZE               0x0000e000
++#define QSCRATCH_PA             0x04ef8800
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
+ 
+@@ -76,6 +77,131 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * rain, boot-arg sweetusb=3: power the USB block up ourselves. ABL only leaves it running when it
++ * sits in fastboot; booted from boot_a the phone never enumerated. After Linux: RPM votes for the
++ * femto PHY's 1.8 V / 3.1 V rails (DT vdda18 = pm6125_l12, vdda33 = pm6125_l15; vdd = l4 is UFS's
++ * too and on), the usb30_prim GDSC, master 133.33 MHz (GPLL0 / 4.5) and mock UTMI 19.2 MHz,
++ * branch clocks, controller + PHY reset (BCRs), phy-qcom-snps-femto-v2 init with the DT tuning
++ * (param-override-seq), DWC3 globals as ABL's fastboot leaves them, UTMI as the pipe clock
++ * (dwc3-qcom, no SS PHY brought up). Then the usual device start (sweetusb=2).
++ */
++extern bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++#define HSPHY_PA                0x01613000
++#define GCC_USB30_PRIM_BCR      0x1a000
++#define GCC_QUSB2PHY_PRIM_BCR   0x1c000
++#define GCC_USB30_MASTER_RCG    0x1a01c
++#define GCC_USB30_UTMI_RCG      0x1a034
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++usb_mask(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t val)
++{
++	usb_wr(base, off, (usb_rd(base, off) & ~mask) | (val & mask));
++}
++
++static bool
++usb_rcg_set(vm_offset_t gcc, uint32_t rcg, uint32_t cfg)
++{
++	usb_wr(gcc, rcg + 4, cfg);
++	usb_wr(gcc, rcg, usb_rd(gcc, rcg) | 1u);        /* CMD_UPDATE */
++	for (int i = 0; i < 500; i++) {
++		if (!(usb_rd(gcc, rcg) & 1u)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++rain_usb_power_up(vm_offset_t gcc)
++{
++	static const struct { uint32_t ldo, uv; } rails[] = { { 12, 1800000 }, { 15, 3104000 } };
++	bool rpm = true;
++
++	for (unsigned r = 0; r < 2; r++) {
++		for (uint32_t set = 0; set <= 1; set++) {       /* "ldoa" N: "uv", "swen" 1 */
++			rpm &= topaz_rpm_write(set, 0x616F646Cu, rails[r].ldo, 0x00007675u, rails[r].uv);
++			rpm &= topaz_rpm_write(set, 0x616F646Cu, rails[r].ldo, 0x6E657773u, 1);
++		}
++	}
++	printf("SWEET USB: power-up: RPM L12 1.8 V + L15 3.1 V %s\n", rpm ? "on" : "FAILED (going on)");
++
++	usb_mask(gcc, GCC_USB30_PRIM_GDSCR, 1u, 0);     /* SW_COLLAPSE off */
++	int i;
++	for (i = 0; i < 100 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & (1u << 31)); i++) {
++		delay(100);
++	}
++	bool m = usb_rcg_set(gcc, GCC_USB30_MASTER_RCG, (1u << 8) | 8u);   /* GPLL0_OUT_MAIN, /4.5 */
++	bool u = usb_rcg_set(gcc, GCC_USB30_UTMI_RCG, 0);                  /* TCXO, /1 */
++	for (unsigned c = 0; c < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); c++) {
++		usb_mask(gcc, usb_cbcr[c].off, 1u, 1u);  /* CLK_ENABLE */
++	}
++	delay(100);
++	printf("SWEET USB: power-up: GDSC 0x%08x, RCGs %s/%s, master CBCR 0x%08x utmi 0x%08x\n",
++	    usb_rd(gcc, GCC_USB30_PRIM_GDSCR), m ? "ok" : "STUCK", u ? "ok" : "STUCK",
++	    usb_rd(gcc, usb_cbcr[0].off), usb_rd(gcc, usb_cbcr[2].off));
++
++	/* controller and PHY reset */
++	usb_mask(gcc, GCC_USB30_PRIM_BCR, 1u, 1u);
++	usb_mask(gcc, GCC_QUSB2PHY_PRIM_BCR, 1u, 1u);
++	delay(100);
++	usb_mask(gcc, GCC_QUSB2PHY_PRIM_BCR, 1u, 0);
++	usb_mask(gcc, GCC_USB30_PRIM_BCR, 1u, 0);
++	delay(100);
++
++	vm_offset_t phy = ml_io_map(HSPHY_PA, 0x1000);
++	if (phy == 0) {
++		printf("SWEET USB: power-up: PHY map failed\n");
++		return;
++	}
++	usb_mask(phy, 0x94, 1u << 1, 1u << 1);          /* CFG0: UTMI_PHY_CMN_CTRL_OVERRIDE_EN */
++	usb_mask(phy, 0x50, 1u << 1, 1u << 1);          /* UTMI_CTRL5: POR */
++	usb_mask(phy, 0x54, 7u << 4, 0);                /* HS_PHY_CTRL_COMMON0: FSEL */
++	usb_mask(phy, 0x58, 1u << 5, 1u << 5);          /* HS_PHY_CTRL_COMMON1: PLLBTUNE */
++	usb_mask(phy, 0xa0, 3u, 2u);                    /* REFCLK_CTRL: REFCLK_SEL default */
++	usb_mask(phy, 0x58, 1u << 4, 1u << 4);          /* VBUSVLDEXTSEL0 */
++	usb_mask(phy, 0x60, 1u, 1u);                    /* HS_PHY_CTRL1: VBUSVLDEXT0 */
++	usb_wr(phy, 0x6c, 0x67);                        /* DT qcom,param-override-seq: TUNE1..3 */
++	usb_wr(phy, 0x70, 0x0f);
++	usb_wr(phy, 0x74, 0x2c);
++	usb_mask(phy, 0x5c, 1u, 1u);                    /* HS_PHY_CTRL_COMMON2: VREGBYPASS */
++	usb_mask(phy, 0x64, 3u << 2, 3u << 2);          /* HS_PHY_CTRL2: USB2_SUSPEND_N_SEL | USB2_SUSPEND_N */
++	usb_mask(phy, 0x3c, 1u, 1u);                    /* UTMI_CTRL0: SLEEPM */
++	delay(10);
++	usb_mask(phy, 0x50, 1u << 1, 0);                /* POR released */
++	delay(10);
++	usb_mask(phy, 0x64, 1u << 3, 0);                /* USB2_SUSPEND_N_SEL */
++	usb_mask(phy, 0x94, 1u << 1, 0);
++	delay(1000);
++
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (qs == 0 || dwc == 0) {
++		printf("SWEET USB: power-up: DWC3 map failed\n");
++		return;
++	}
++	/* QSCRATCH_GENERAL_CFG: the UTMI clock stands in for the SS PHY's pipe clock */
++	usb_mask(qs, 0x08, 1u << 8, 1u << 8);                           /* PIPE_UTMI_CLK_DIS */
++	delay(200);
++	usb_mask(qs, 0x08, (1u << 0) | (1u << 3), (1u << 0) | (1u << 3)); /* PIPE_UTMI_CLK_SEL, PIPE3_PHYSTATUS_SW */
++	delay(200);
++	usb_mask(qs, 0x08, 1u << 8, 0);
++	usb_wr(dwc, 0xc110, 0x00112000);        /* GCTL: device, PWRDNSCALE 2 (what ABL leaves) */
++	usb_wr(dwc, 0xc200, 0x00002400);        /* GUSB2PHYCFG: UTMI 8 bit, USBTRDTIM 9 */
++	printf("SWEET USB: power-up: PHY UTMI_CTRL5 0x%02x CTRL2 0x%02x; GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GENERAL_CFG 0x%08x\n",
++	    usb_rd(phy, 0x50), usb_rd(phy, 0x64), usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118),
++	    usb_rd(qs, 0x08));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -83,7 +209,7 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 report state only, 2 also start the USB device, 3 power it up first (rain) */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+@@ -93,6 +219,9 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	if (enabled >= 3) {
++		rain_usb_power_up(gcc);
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -173,7 +302,6 @@ sweet_usb_probe(void)
+  * session; Linux dwc3-qcom forces that in software when the charger
+  * reports a cable (dwc3_qcom_vbus_override_enable).
+  */
+-#define QSCRATCH_PA             0x04ef8800
+ #define QSCRATCH_HS_PHY_CTRL    0x10
+ #define   UTMI_OTG_VBUS_VALID   (1u << 20)
+ #define   SW_SESSVLD_SEL        (1u << 28)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ae9b25e..4f2a5a2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -812,6 +812,7 @@ static uint64_t sweet_fb_swap_count;
+  * two, and how many came more than 20 ms after the one before (a vsync missed).
+  */
+ static uint64_t sweet_fps_wait_ns, sweet_fps_after_ns;  /* this second: latch waits, tick-to-swap */
++static uint64_t sweet_fps_gpu_ns;                       /* this second: of the present, waiting for the GPU */
+ 
+ static void
+ sweet_fps_count(void)
+@@ -849,9 +850,10 @@ sweet_fps_count(void)
+ 	absolutetime_to_nanoseconds(now - window, &ns);
+ 	if (ns >= 1000000000ull) {
+ 		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame: %llu us in present + latch, "
+-		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
+-		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);
+-		sweet_fps_wait_ns = sweet_fps_after_ns = 0;
++		    "came %llu us after the tick; %llu us of it waiting for the GPU\n", frames, ns / 1000000, gap_max / 1000000, late,
++		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0,
++		    frames ? sweet_fps_gpu_ns / 1000 / frames : 0);
++		sweet_fps_wait_ns = sweet_fps_after_ns = sweet_fps_gpu_ns = 0;
+ 		window = now;
+ 		frames = late = 0;
+ 		gap_max = 0;
+@@ -1490,12 +1492,20 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		return false;
+ 	}
+ 	bool ok = false;
++	uint64_t gpuWaitStart = mach_absolute_time(), gpuWaitNs = 0;
+ 	(void)topaz_surface_drawn(s, 100);
+-	if (fHwScale && fFitCrop == 0 && s->gpuPool && s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
++	absolutetime_to_nanoseconds(mach_absolute_time() - gpuWaitStart, &gpuWaitNs);
++	sweet_fps_gpu_ns += gpuWaitNs;
++	if (fHwScale && s->gpuPool && s->scanoutPhys != 0 && s->bytesPerElement == 4 &&
+ 	    s->width == fLogicalW && s->height == fLogicalH && (s->bytesPerRow & 0xf) == 0) {
+-		uint64_t pa = s->scanoutPhys + s->offset;
+-		if ((pa & 0xf) == 0 && pa + (uint64_t)s->height * s->bytesPerRow < (1ull << 32)) {
+-			scanScaled(pa, s->bytesPerRow, s->width, s->height);
++		/*
++		 * fit=3: the canvas is scaled to fWidth + 2 * fFitCrop columns and fFitCrop cut off each side.
++		 * The scaler crops in source columns instead (a multiple of 4: the base stays 16-byte aligned).
++		 */
++		uint32_t cx = fFitCrop ? (uint32_t)(((uint64_t)fFitCrop * s->width / (fWidth + 2 * fFitCrop) + 2) & ~3ull) : 0;
++		uint64_t pa = s->scanoutPhys + s->offset + (uint64_t)cx * 4;
++		if ((pa & 0xf) == 0 && 2 * cx < s->width && pa + (uint64_t)s->height * s->bytesPerRow < (1ull << 32)) {
++			scanScaled(pa, s->bytesPerRow, s->width - 2 * cx, s->height);
+ 			IOLockLock(fLock);
+ 			fLastVA = NULL;
+ 			IOLockUnlock(fLock);
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..5fda462 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,8 +19,57 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
+ };
+ 
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++/*
++ * rain: the PM6125 RTC (rtc-pm8xxx, pm8941 layout: RTC_RW at 0x6000, RDATA0..3 at 0x6048) counts
++ * seconds but is read-only to the apps processor; Android keeps the wall clock as RTC + an offset
++ * of its own. Ours is boot-arg rtc_off (seconds). Re-read when the low byte rolled over meanwhile.
++ */
++static bool
++rain_rtc_raw(uint32_t *secs)
++{
++	uint8_t b[4], again;
++
++	if (sweet_spmi_init() != 0) {
++		return false;
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, 0x6048 + i, &b[i]) != 0) {
++				return false;
++			}
++		}
++		if (sweet_spmi_read(0, 0x6048, &again) != 0) {
++			return false;
++		}
++		if (again == b[0]) {
++			*secs = b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			return true;
++		}
++	}
++	return false;
++}
++
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t raw;
++	int64_t off = 0;
++
++	if (!rain_rtc_raw(&raw)) {
++		IOLog("RAIN RTC: not readable, the clock starts at 1970\n");
++		return 0;
++	}
++	PE_parse_boot_argn("rtc_off", &off, sizeof(off));
++	IOLog("RAIN RTC: raw %u, rtc_off %lld -> %lld\n", raw, off, (int64_t)raw + off);
++	return (long)((int64_t)raw + off);
++}
++
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+@@ -30,6 +80,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
++	publishResource("IORTC");       /* IOKitInitializeTime waits up to 30 s for one; ours is getGMTTimeOfDay */
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
