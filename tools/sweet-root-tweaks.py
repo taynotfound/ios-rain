@@ -11,7 +11,8 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  crash-loops and Setup blocks on its CoreTelephony XPC); bluetoothd
+                  removed too on rain (no BT driver: crash loop, About hangs)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -64,11 +65,12 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    # rain: bluetoothd crash-loops without a Bluetooth driver and Settings > About hangs on it
+    removed = [k for k, j in jobs.items() if j.get('Label') in ('com.apple.CommCenter', 'com.apple.bluetoothd')]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter/bluetoothd jobs removed')
 
 
 def containers(root):

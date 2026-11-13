@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 01:10:00 +0100
+Subject: [PATCH] rain-1007: map the APCS doorbell on first use
+
+sweetusb=3 votes the USB PHY rails through the RPM before the modem/ADSP
+code has mapped the APCS IPC register: topaz_apcs_kick wrote through
+NULL (data abort, far 0x8). Map it there when nobody has yet.
+---
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 81a7122..a11449f 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6322,6 +6322,9 @@ topaz_smem_alloc(void *part, uint16_t item, uint32_t size)
+ extern "C" void
+ topaz_apcs_kick(unsigned bit)
+ {
++	if (apcs == NULL) {     /* rain: the RPM link (USB power-up) may come before the modem/ADSP code maps it */
++		apcs = (volatile uint8_t *)ml_io_map(APCS_PA, 0x1000);
++	}
+ 	mb();
+ 	*(volatile uint32_t *)(apcs + APCS_IPC) = 1u << bit;
+ 	mb();
