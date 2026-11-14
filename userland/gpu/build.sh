@@ -23,9 +23,11 @@ $CC -o "$O/backboardd" "$G/bbd_wrap.c"
 # CoreAudio HAL plug-in (the "Speaker" device writing to the kernel's /dev/redwood-audio)
 $CC -bundle -framework CoreFoundation -I"$G/../audio" -o "$O/RedwoodAudio" "$G/../audio/audio_plugin.c"
 cp "$G/../audio/audio_plugin.plist" "$O/RedwoodAudio.Info.plist"
+# one-shot: grow the 16 GiB HFS+ root to fill userdata (launchd org.rain.hfs-grow)
+$CC -o "$O/hfs-grow" "$G/../tools/hfs_grow.c"
 cp "$M/libOSMesa.8.dylib" "$O/"
 # Ad-hoc signatures: the kernel's AMFI stand-in makes every *signed* binary on the root a platform
 # binary, and launchd panics when a system job execs one that is not ("unexpected exec of non-platform binary").
-codesign -f -s - "$O/backboardd" "$O/RedwoodAudio" "$O"/*.dylib
+codesign -f -s - "$O/backboardd" "$O/RedwoodAudio" "$O/hfs-grow" "$O"/*.dylib
 rm -rf "$O/inc"
 ls -l "$O"

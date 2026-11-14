@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 18:00:00 +0100
+Subject: [PATCH] rain-1011: power off and restart through PSCI
+
+Nothing set PE_halt_restart, so "slide to power off" (and restart) got -1
+from IOPlatformExpert::haltRestart and the phone hung until forced off.
+SweetPlatformExpert::haltRestart now calls PSCI SYSTEM_OFF / SYSTEM_RESET,
+with PS_HOLD low as the fallback. Panic types keep the old behaviour.
+---
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 5fda462..397f1f5 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -20,9 +20,11 @@ public:
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ extern "C" int sweet_spmi_init(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ /*
+@@ -70,6 +72,37 @@ SweetPlatformExpert::getGMTTimeOfDay(void)
+ 	return (long)((int64_t)raw + off);
+ }
+ 
++/*
++ * rain: nothing set PE_halt_restart, so "slide to power off" and restart reached
++ * IOPlatformExpert::haltRestart, got -1 and the phone hung until a forced power-off.
++ * PSCI SYSTEM_OFF / SYSTEM_RESET (TZ programs the PMIC); PS_HOLD low as the fallback.
++ * Panics keep the old path so the panic screen stays readable.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	uint64_t fn;
++
++	if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU) {
++		fn = 0x84000008u;       /* PSCI SYSTEM_OFF */
++	} else if (type == kPERestartCPU) {
++		fn = 0x84000009u;       /* PSCI SYSTEM_RESET */
++	} else {
++		return IODTPlatformExpert::haltRestart(type);
++	}
++	IOLog("RAIN: %s via PSCI\n", fn == 0x84000008u ? "power off" : "restart");
++	__asm__ volatile("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = fn;
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	vm_offset_t pshold = ml_io_map(0x0440b000u, 0x1000);    /* MPM PS_HOLD */
++	if (pshold) {
++		*(volatile uint32_t *)pshold = 0;
++	}
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ bool

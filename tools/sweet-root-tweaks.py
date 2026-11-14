@@ -77,6 +77,13 @@ def launchd(root):
             print('launchd.plist: bluetoothd job restored')
         else:
             print(f'warning: bluetoothd job missing and no {ref}')
+    # rain: grow the 16 GiB HFS+ root to the whole userdata partition (no-op once grown)
+    if os.path.exists(os.path.join(root, 'topaz/bin/hfs-grow')):
+        jobs['/System/Library/LaunchDaemons/org.rain.hfs-grow.plist'] = {
+            'Label': 'org.rain.hfs-grow', 'ProgramArguments': ['/topaz/bin/hfs-grow'],
+            'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True, 'UserName': 'root',
+            'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console'}
+        print('launchd.plist: org.rain.hfs-grow job installed')
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
 

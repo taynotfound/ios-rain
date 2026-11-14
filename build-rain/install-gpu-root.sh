@@ -3,6 +3,7 @@
 #   /topaz/lib/{libOSMesa.8,libtopaz-gl,libtopaz-inject}.dylib
 #   /usr/libexec/backboardd -> wrapper; the real one moves to /usr/libexec/real/backboardd
 #   /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
+#   /topaz/bin/hfs-grow (run once per boot by launchd, see tools/sweet-root-tweaks.py)
 #   /usr/share/firmware/topaz/{a610_zap.mdt,a610_zap.b02,a630_sqe.fw}: Adreno firmware from this phone's
 #     own vendor image (research/fw-fog/gpu, not in git; the zap shader is signed for the device)
 # Without boot-arg gpu=1 the loader does nothing, so the image still boots as before.
@@ -12,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 img=research/ipsw/ios16-root.img
 G=userland/out-gpu
-for f in libOSMesa.8.dylib libtopaz-gl.dylib libtopaz-inject.dylib backboardd RedwoodAudio RedwoodAudio.Info.plist; do
+for f in libOSMesa.8.dylib libtopaz-gl.dylib libtopaz-inject.dylib backboardd RedwoodAudio RedwoodAudio.Info.plist hfs-grow; do
 	[ -s "$G/$f" ] || { echo "missing $G/$f"; exit 1; }
 done
 FW=research/fw-fog/gpu
@@ -37,6 +38,8 @@ fi
 install -m 755 -o 0 -g 0 "$G/backboardd" "$L/backboardd"
 install -d -m 755 -o 0 -g 0 "$mnt/topaz" "$mnt/topaz/lib"
 install -m 755 -o 0 -g 0 "$G"/*.dylib "$mnt/topaz/lib/"
+install -d -m 755 -o 0 -g 0 "$mnt/topaz/bin"
+install -m 755 -o 0 -g 0 "$G/hfs-grow" "$mnt/topaz/bin/hfs-grow"
 A="$mnt/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
 install -d -m 755 -o 0 -g 0 "$A"
 install -m 755 -o 0 -g 0 "$G/RedwoodAudio" "$A/RedwoodAudio"

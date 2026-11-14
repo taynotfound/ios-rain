@@ -48,5 +48,6 @@ jobs:
             userland/out-gpu/backboardd
             userland/out-gpu/RedwoodAudio
             userland/out-gpu/RedwoodAudio.Info.plist
+            userland/out-gpu/hfs-grow
             userland/out-gpu/eagl_gen.h
           if-no-files-found: error
