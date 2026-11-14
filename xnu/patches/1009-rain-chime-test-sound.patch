@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 01:45:00 +0100
+Subject: [PATCH] rain-1009: a soft chord instead of the 1 kHz test tone
+
+adsp_tone=N played a 1 kHz near-square wave that hurt. Now an F major
+chord (F3 C4 F4 A4 C5) with a 20 ms fade-in and ~3 s decay, peak half
+of full scale, integer only (sine table + phase accumulators).
+---
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 7e6337f..76a68b8 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2045,15 +2045,48 @@ apr_pump(void)
+ 	}
+ }
+ 
+-/* boot-arg adsp_tone=N with APR: N seconds of 1 kHz through the same path iOS uses */
++/* boot-arg adsp_tone=N with APR: N seconds (the chime below) through the same path iOS uses */
+ static unsigned tone_end_ms;
+ static uint64_t tone_frames;
+ static unsigned tone_t0;
+ 
++/*
++ * The test sound: a soft F major chord (F3 C4 F4 A4 C5), 20 ms fade-in and a decay of about 3 s, in the
++ * spirit of the Mac startup chime (the old 1 kHz near-square wave hurt). Integer only: a 256-point
++ * sine table with linear interpolation, 32-bit phase accumulators, the envelope in Q30.
++ */
++static const int16_t chime_sin[257] = {
++		0, 804, 1608, 2410, 3212, 4011, 4808, 5602, 6393, 7179, 7962, 8739,
++		9512, 10278, 11039, 11793, 12539, 13279, 14010, 14732, 15446, 16151, 16846, 17530,
++		18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594, 23170, 23731, 24279, 24811,
++		25329, 25832, 26319, 26790, 27245, 27683, 28105, 28510, 28898, 29268, 29621, 29956,
++		30273, 30571, 30852, 31113, 31356, 31580, 31785, 31971, 32137, 32285, 32412, 32521,
++		32609, 32678, 32728, 32757, 32767, 32757, 32728, 32678, 32609, 32521, 32412, 32285,
++		32137, 31971, 31785, 31580, 31356, 31113, 30852, 30571, 30273, 29956, 29621, 29268,
++		28898, 28510, 28105, 27683, 27245, 26790, 26319, 25832, 25329, 24811, 24279, 23731,
++		23170, 22594, 22005, 21403, 20787, 20159, 19519, 18868, 18204, 17530, 16846, 16151,
++		15446, 14732, 14010, 13279, 12539, 11793, 11039, 10278, 9512, 8739, 7962, 7179,
++		6393, 5602, 4808, 4011, 3212, 2410, 1608, 804, 0, -804, -1608, -2410,
++		-3212, -4011, -4808, -5602, -6393, -7179, -7962, -8739, -9512, -10278, -11039, -11793,
++		-12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530, -18204, -18868, -19519, -20159,
++		-20787, -21403, -22005, -22594, -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
++		-27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956, -30273, -30571, -30852, -31113,
++		-31356, -31580, -31785, -31971, -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
++		-32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285, -32137, -31971, -31785, -31580,
++		-31356, -31113, -30852, -30571, -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
++		-27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731, -23170, -22594, -22005, -21403,
++		-20787, -20159, -19519, -18868, -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
++		-12539, -11793, -11039, -10278, -9512, -8739, -7962, -7179, -6393, -5602, -4808, -4011,
++		-3212, -2410, -1608, -804, 0
++};
++static const uint32_t chime_inc[5] = { 15623838u, 23410256u, 31248571u, 39370534u, 46819617u };      /* f * 2^32 / 48000 */
++static const int32_t chime_gain[5] = { 5400, 4000, 4000, 3300, 2600 };     /* Q15, sum about 0.6 of full scale */
++
+ static void
+ apr_tone_feed(void)
+ {
+-	static const int16_t q[13] = { 0, 428, 848, 1253, 1638, 1997, 2317, 2604, 2838, 3020, 3165, 3240, 3277 };
++	static uint32_t phase[5];
++	static int64_t env;
+ 	int16_t buf[480 * 2];
+ 
+ 	if (tone_end_ms == 0) {
+@@ -2064,11 +2097,27 @@ apr_tone_feed(void)
+ 		LOG("t=%u.%03u tone: done (%u buffers sent, %u done)", T, apr_wsent, apr_wdone);
+ 		return;
+ 	}
++	if (tone_frames == 0) {
++		bzero(phase, sizeof(phase));
++		env = 0;
++	}
+ 	while (tone_frames < (uint64_t)(ms() - tone_t0) * 48 + 480) {
+ 		for (uint32_t f = 0; f < 480; f++) {
+-			uint32_t k = (uint32_t)((tone_frames + f) % 48), a = k % 24;
+-			int16_t v = a <= 12 ? q[a] : q[24 - a];
+-			buf[2 * f] = buf[2 * f + 1] = k < 24 ? v : (int16_t)-v;
++			uint64_t n = tone_frames + f;
++			int64_t mix = 0;
++			for (int i = 0; i < 5; i++) {
++				uint32_t idx = phase[i] >> 24, frac = (phase[i] >> 16) & 0xff;
++				int32_t a = chime_sin[idx], b = chime_sin[idx + 1];
++				mix += (int64_t)chime_gain[i] * (a + (((b - a) * (int32_t)frac) >> 8));
++				phase[i] += chime_inc[i];
++			}
++			if (n < 960) {
++				env = ((int64_t)n << 30) / 960;    /* fade in */
++			} else {
++				env -= env >> 15;                  /* time constant 0.68 s: -40 dB after ~3 s */
++			}
++			int32_t v = (int32_t)(((mix >> 15) * (env >> 14)) >> 16);
++			buf[2 * f] = buf[2 * f + 1] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+ 		}
+ 		(void)topaz_audio_write(buf, 480);
+ 		tone_frames += 480;
