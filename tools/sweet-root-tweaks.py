@@ -16,7 +16,8 @@ screen (image versions v8-v14 in NOTES.md):
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
-  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
+  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash) unless
+                  RedwoodAudio.driver is installed (then it is the router to it)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -119,7 +120,15 @@ def activation(root):
 def audio(root):
     src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
+    off = os.path.join(dst_dir, 'VirtualAudio.plugin')
+    # VirtualAudio crashed mediaserverd while there was no audio device at all (no 'vdef'). With
+    # RedwoodAudio (Speaker, Hawking, Actuator, Codec) installed it is what routes iOS's sound to
+    # them: without it the plug-in is opened but never played through (rain, 14 November).
+    if os.path.isdir(os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver')):
+        if os.path.exists(off) and not os.path.exists(src):
+            shutil.move(off, os.path.dirname(src))
+            print('VirtualAudio.plugin enabled again (RedwoodAudio is installed)')
+    elif os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
