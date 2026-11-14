@@ -68,15 +68,13 @@ def launchd(root):
     removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
     for k in removed:
         del jobs[k]
-    # rain: removing bluetoothd (About hangs on its crash loop) left SpringBoard spinning at the Apple
-    # logo: put Apple's job back (saved from the IPSW's launchd.plist, not in git)
-    ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../build-rain/work/bluetoothd-job.plist')
-    if not any(j.get('Label') == 'com.apple.bluetoothd' for j in jobs.values()):
-        if os.path.exists(ref):
-            jobs[load(ref)['key']] = load(ref)['job']
-            print('launchd.plist: bluetoothd job restored')
-        else:
-            print(f'warning: bluetoothd job missing and no {ref}')
+    # rain: fairplayd.H2 and bluetoothd crash-loop (no FairPlay/BT hardware). launchd keeps their ports,
+    # so clients wait forever: locationd's CLMescalSigner (sampled, MIG 1203) and with it Settings >
+    # Date & Time; About on bluetoothd. Without the jobs the lookups fail at once.
+    dead = [k for k, j in jobs.items() if j.get('Label') in ('com.apple.fairplayd.H2', 'com.apple.bluetoothd')]
+    for k in dead:
+        del jobs[k]
+    print(f'launchd.plist: {len(dead)} crash-looping jobs removed (fairplayd.H2, bluetoothd)')
     # rain: grow the 16 GiB HFS+ root to the whole userdata partition (no-op once grown)
     if os.path.exists(os.path.join(root, 'topaz/bin/hfs-grow')):
         jobs['/System/Library/LaunchDaemons/org.rain.hfs-grow.plist'] = {
