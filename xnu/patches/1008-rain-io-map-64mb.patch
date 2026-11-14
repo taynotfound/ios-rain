@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 01:20:00 +0100
+Subject: [PATCH] rain-1008: 64 MB for ml_io_map device windows
+
+arm's io_submap is 8 MB of permanent mappings. With adsp=1 the LPASS
+window (0x360000) no longer fit: kmem_alloc(..., 3538944, NOFAIL)
+failed with KERN_NO_SPACE and panicked right after RPM L14 on.
+---
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f0..21a6310 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,7 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++#define IO_MAP_SIZE            (64ul << 20)     /* rain: device windows (GCC, MDP, GPU, modem, USB, LPASS 3.4 MB) outgrew 8 MB */
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
