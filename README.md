@@ -5,8 +5,8 @@
 
 As of **2026-11-14** the phone boots into the **iOS home screen** with **touch**, the volume and lock
 keys, the **Adreno GPU drawing the interface at 36–49 frames a second**, **sound through the speaker**,
-the **battery level**, **vibration** and the **clock**. Wi-Fi, brightness, Settings > About and
-Settings > Date & Time do not work yet. This is an experiment, not a usable phone OS.
+the **battery level**, **vibration**, the **clock**, **110 GB of storage** and a real **Shut Down**.
+Wi-Fi and brightness do not work yet. This is an experiment, not a usable phone OS.
 
 Website: **<https://taynotfound.github.io/ios-rain/>**
 
@@ -40,13 +40,13 @@ values in the shim and `tools/mkadt.py`, `build-rain/`, and the porting log
 | Boot | Works, **without a PC**: stock Xiaomi ABL boots the shim (boot image v4) from `boot_a`, which starts XNU on Gold core `0x100`. The bootloader does not count down retries for slot a. `boot_a` still holds an image from 2026-11-12; today's fixes are tested with `fastboot boot` only |
 | CPU | The four Cortex-A73 cores (`cpus=4`) |
 | Memory | 2 GiB for the kernel (the `0xC0000000` bank, `build-rain/rain-ios-2g.adt`); GPU pool below it (0985), modem pool at `0xBC000000` (0999); 64 MB for device mappings (1008) |
-| Storage | Works. UFS at `0x4804000`; the iOS root is a 16 GB HFS+ volume in `userdata` (the partition has ~100 GB, so iOS shows little free space for now) |
-| iOS userland | Works. iPhone X 16.7.16 (20H392) root; lock screen, home screen, Settings. The first boot after flashing `userdata` sits on the Apple logo for about 15 minutes. **Settings > General > About hangs** (bluetoothd crash-loops: no Bluetooth driver) and **Settings > Date & Time crashes** |
+| Storage | Works. UFS at `0x4804000`; the iOS root is flashed as a 16 GB HFS+ image and grows itself to all of `userdata` (~110 GB) on first boot (`hfs-grow`, a one-shot launchd job) |
+| iOS userland | Works. iPhone X 16.7.16 (20H392) root; lock screen, home screen, Settings. The first boot after flashing `userdata` sits on the Apple logo for about 15 minutes. About and Date & Time work: the crash-looping `fairplayd.H2` and `bluetoothd` jobs are removed (locationd waited forever on FairPlay). Settings > General > Shut Down powers off (1011); with USB plugged in the phone starts again by itself |
 | Display | Works: `sweetfb_fit=3` scales the 1125×2436 canvas to 740×1650 and cuts 10 columns off each side; `sweetfb_hwscale=1` does it in the display controller's own scaler (no CPU copy, 1006) |
 | GPU | Works (`gpu=1 gpu_mhz=600`): Adreno 610 through Mesa freedreno (user space built by `.github/workflows/userland.yml`, installed with `build-rain/install-gpu-root.sh`). **36–49 fps** |
 | Touch | Works (0962–0984), also after locking and unlocking. Novatek NT36525B over SPI through GPI DMA; Xiaomi's firmware uploaded at boot and on every panel wake |
 | Keys | Volume and lock keys work. Volume up + down for 3 s reboots into fastboot (0989) |
-| Clock | Works (1006): the PM6125 RTC plus boot arg `rtc_off` (the RTC is read-only to Linux/XNU and resets when the battery runs flat). The timezone is still the iPhone default (US Pacific) |
+| Clock | Works (1006): the PM6125 RTC plus boot arg `rtc_off` (the RTC is read-only to Linux/XNU and resets when the battery runs flat). Set the timezone by hand in Settings > General > Date & Time (automatic needs a location fix) |
 | Live log | Works: `sweetusb=2` (from `fastboot boot`) or `sweetusb=3` (also powers USB up itself, for boots from `boot_a`, 1006/1007) makes the phone a USB network device that streams the kernel log |
 | Battery | Works: SH366101 gauge at SE1 `0x55` (level, voltage, current, temperature; 0997–1002) |
 | Charging | Works: SMB1351 charger, high-current mode on wall chargers (1001); a PC port stays at 500 mA |
@@ -58,8 +58,8 @@ values in the shim and `tools/mkadt.py`, `build-rain/`, and the porting log
 
 ### Next
 
-Wi-Fi; brightness (test 1004); Settings > About (stop bluetoothd's crash loop) and Date & Time; a
-bigger iOS volume; the final kernel in `boot_a` with sound, clock and USB power-up.
+Wi-Fi; brightness (test 1004); Bluetooth (a real driver, then bluetoothd back); the power-off button
+combination; the final kernel in `boot_a` with sound, clock, USB power-up and power-off.
 
 Security is off, as upstream: permissive AMFI and sandbox, no data protection.
 
