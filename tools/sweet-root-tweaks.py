@@ -124,6 +124,28 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+ZONE = 'Europe/Berlin'      # rain: the owner's zone; Settings > Date & Time crashes, so it cannot be picked there
+
+
+def timezone(root):
+    """Point /var/db/timezone/localtime at ZONE, in the same zoneinfo tree the image already uses."""
+    link = os.path.join(root, 'private/var/db/timezone/localtime')
+    old = os.readlink(link) if os.path.islink(link) else None
+    base = old.split('zoneinfo/')[0] + 'zoneinfo/' if old and 'zoneinfo/' in old else '/usr/share/zoneinfo/'
+    target = base + ZONE
+    inside = target.lstrip('/')
+    if inside.startswith('var/'):       # /var is a link to private/var: resolve it inside the image, not on the PC
+        inside = 'private/' + inside
+    if not os.path.exists(os.path.join(root, inside)):
+        print(f'warning: timezone {target} not in the image (localtime stays {old})')
+        return
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(target, link)
+    print(f'timezone: localtime {old} -> {target}')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -132,6 +154,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    timezone(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
