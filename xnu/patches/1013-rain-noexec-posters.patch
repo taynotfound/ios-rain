@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 20:15:00 +0100
+Subject: [PATCH] rain-1013: rain_noexec, keep the lock-screen renderers out
+
+After a fresh userdata, CollectionsPoster and AegirPoster (the default
+lock-screen posters) fill the 768 MB surface cap (0995), their creates
+fail with kIOReturnNoMemory, and they and their hosts crash-loop
+(nanotimekitcompaniond 123 starts): the UI becomes unusable. boot-arg
+rain_noexec=a,b refuses exec of the named programs; default
+"CollectionsPoster,AegirPoster", "-" refuses nothing.
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 4710f0b..7527e84 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7570,6 +7570,32 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			/*
++			 * rain: boot-arg rain_noexec=a,b refuses these programs (default: the lock-screen
++			 * renderers CollectionsPoster and AegirPoster, which fill the 768 MB surface cap
++			 * after a fresh userdata and crash-loop; "-" refuses nothing).
++			 */
++			{
++				static char noexec[128] = "CollectionsPoster,AegirPoster";
++				static bool parsed;
++				if (!parsed) {
++					(void)PE_parse_boot_argn("rain_noexec", noexec, sizeof(noexec));
++					parsed = true;
++				}
++				size_t n = strlen(p->p_name);
++				for (const char *c = noexec; n && *c;) {
++					const char *e = strchr(c, ',');
++					size_t len = e ? (size_t)(e - c) : strlen(c);
++					if (len == n && strncmp(c, p->p_name, n) == 0) {
++						printf("rain: exec of %s refused (rain_noexec)\n", p->p_name);
++						signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++						    EXEC_EXIT_REASON_WRONG_PLATFORM);
++						error = EPERM;
++						goto done;
++					}
++					c += len + (e != NULL);
++				}
++			}
+ 			/* topaz: does the window server get our library (GPU's OpenGL ES)? */
+ 			if (strcmp(p->p_name, "backboardd") == 0 && imgp->ip_endargv != NULL && imgp->ip_endenvv != NULL) {
+ 				const char *e = imgp->ip_endargv, *end = imgp->ip_endenvv;
