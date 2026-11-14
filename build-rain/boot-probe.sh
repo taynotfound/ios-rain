@@ -20,7 +20,7 @@ fi
 FW=research/fw-fog/novatek_ts_fw.bin
 python3 tools/mkpayload.py "xnu/out-$N/kernel.development.sweet" build-rain/rain-ios-2g.adt "build-rain/payload-$T.bin" \
   ${FW:+$( [ -f "$FW" ] && echo --blob TouchFW=$FW )} \
-  --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetchg=0 sweetfb_noshadow=1 sweetfb_fit=2 raintouch=1 sweettouchdelay=0 raintouchpause=0 sweetfb_noconsole=1 sweetfb_hz=60 gpu=1 gpu_mhz=600 $4" >/dev/null
+  --cmdline "debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetchg=0 sweetfb_noshadow=1 sweetfb_fit=3 raintouch=1 sweettouchdelay=0 raintouchpause=0 sweetfb_noconsole=1 sweetfb_hz=60 gpu=1 gpu_mhz=600 $4" >/dev/null
 PATH=$P/build-rain/bin:$PATH MKBOOTIMG=mkbootimg bash shim/build.sh "$P/build-rain/payload-$T.bin" >/dev/null 2>&1
 cp shim/out/shim-boot.img "build-rain/shim-xnu-rain-touch$T.img"
 # Xiaomi's ABL stops taking data after idling in fastboot: time the transfer out and wait for a fresh session
