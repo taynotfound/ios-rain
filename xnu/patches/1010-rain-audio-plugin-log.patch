@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 02:30:00 +0100
+Subject: [PATCH] rain-1010: the audio plug-in's lines in the kernel log
+
+mediaserverd opens /dev/redwood-audio but never sets a volume or writes,
+and the plug-in's say() only went to stderr. ioctl _IOW('r', 2, 120
+bytes) prints one line as "RedwoodAudio: ...", on the real device
+(TopazAudio, adsp=1) and the stand-in (rain_haptic.c).
+---
+diff --git a/bsd/dev/rain_haptic.c b/bsd/dev/rain_haptic.c
+index 606d8a9..b785001 100644
+--- a/bsd/dev/rain_haptic.c
++++ b/bsd/dev/rain_haptic.c
+@@ -119,12 +119,18 @@ astub_write(dev_t dev __unused, struct uio *uio, int flags __unused)
+ 
+ struct astub_volume { uint32_t below; uint32_t muted; };     /* sys/redwood_audio.h */
+ 
++struct astub_log { char text[120]; };
++
+ static int
+ astub_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, struct proc *p __unused)
+ {
+ 	if (cmd == _IOW('r', 1, struct astub_volume)) {
+ 		const uint32_t *v = (const uint32_t *)data;
+ 		printf("RAIN AUDIO: volume %u/8 dB under the top%s\n", v[0], v[1] ? ", muted" : "");
++	} else if (cmd == _IOW('r', 2, struct astub_log)) {      /* the plug-in's own lines (say()) */
++		struct astub_log *l = (struct astub_log *)data;
++		l->text[sizeof(l->text) - 1] = 0;
++		printf("RedwoodAudio: %s", l->text);
+ 	}
+ 	return 0;
+ }
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 8687266..75127b4 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -2296,6 +2296,8 @@ topaz_audio_volume(uint32_t below, uint32_t muted)
+ 
+ struct topaz_audio_volume_arg { uint32_t below, muted; };
+ #define TOPAZ_AUDIO_SET_VOLUME  _IOW('r', 1, struct topaz_audio_volume_arg)
++struct topaz_audio_log_arg { char text[120]; };
++#define TOPAZ_AUDIO_LOG         _IOW('r', 2, struct topaz_audio_log_arg)    /* the plug-in's own lines (say()) */
+ 
+ static int
+ ta_open(dev_t, int, int, struct proc *)
+@@ -2328,6 +2330,12 @@ ta_write(dev_t, struct uio *uio, int)
+ static int
+ ta_ioctl(dev_t, u_long cmd, caddr_t data, int, struct proc *)
+ {
++	if (cmd == TOPAZ_AUDIO_LOG) {
++		struct topaz_audio_log_arg *l = (struct topaz_audio_log_arg *)data;
++		l->text[sizeof(l->text) - 1] = 0;
++		IOLog("RedwoodAudio: %s", l->text);
++		return 0;
++	}
+ 	if (cmd != TOPAZ_AUDIO_SET_VOLUME) {
+ 		return ENOTTY;
+ 	}

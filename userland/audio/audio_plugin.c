@@ -257,6 +257,14 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+	/* and into the kernel log, through the speaker's device (opened for that alone if need be) */
+	static int logfd = -1;
+	int fd = sink >= 0 ? sink : logfd >= 0 ? logfd : (logfd = open(REDWOOD_AUDIO_DEVICE, O_WRONLY));
+	if (fd >= 0) {
+		struct redwood_audio_log l;
+		strlcpy(l.text, line, sizeof(l.text));
+		(void)ioctl(fd, REDWOOD_AUDIO_LOG, &l);
+	}
 }
 
 /* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */

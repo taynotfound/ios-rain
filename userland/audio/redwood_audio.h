@@ -37,6 +37,12 @@ struct redwood_audio_volume {
 };
 #define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
 
+/* ioctl(REDWOOD_AUDIO_LOG): one line of the plug-in's for the kernel log (mediaserverd's stderr goes nowhere) */
+struct redwood_audio_log {
+	char text[120];
+};
+#define REDWOOD_AUDIO_LOG       _IOW('r', 2, struct redwood_audio_log)
+
 #ifdef KERNEL
 #include <stdbool.h>
 
