@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: taynotfound <marztayron@gmail.com>
+Date: Sat, 14 Nov 2026 20:00:00 +0100
+Subject: [PATCH] rain-1012: Power + Volume down held 3 s powers off cleanly
+
+iOS 16 on an iPhone X maps Side + Volume hold to the Emergency SOS
+screen (with the power-off slider), which never shows on rain (no
+telephony). The keys thread now calls reboot_kernel(RB_HALT) after
+3 s of Power + Volume down: SIGTERM to processes, sync, unmount, then
+1011's PSCI SYSTEM_OFF. Volume up + down stays fastboot (0989).
+---
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 1f719d0..080552c 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,9 +12,11 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/reboot.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern int reboot_kernel(int howto, char *message);
+ void sweet_keys_init(void);
+ 
+ /* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
+@@ -147,7 +149,7 @@ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+ 	int state[3] = {0, 0, 0};
+-	unsigned errors = 0, both = 0;
++	unsigned errors = 0, both = 0, off = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+@@ -175,6 +177,16 @@ keys_thread(void *arg, wait_result_t result)
+ 		if (both == 150) {             /* 150 x 20 ms */
+ 			keys_reboot_fastboot();
+ 		}
++		/*
++		 * rain: Power + Volume down held 3 s = clean power off (processes get SIGTERM, disks
++		 * sync, volumes unmount, then 1011's PSCI SYSTEM_OFF). iOS's own Side + Volume hold
++		 * opens Emergency SOS, which never appears here (no telephony).
++		 */
++		off = (state[0] && state[2] && !state[1]) ? off + 1 : 0;
++		if (off == 150) {
++			printf("RAIN KEYS: power and vol- held: shutting down\n");
++			reboot_kernel(RB_HALT, "power + volume down");
++		}
+ 		keys_wait();
+ 	}
+ }
