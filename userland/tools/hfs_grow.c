@@ -13,9 +13,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/disk.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+
+/* the iOS SDK ships no sys/disk.h; values from xnu bsd/sys/disk.h */
+#define DKIOCGETBLOCKSIZE  _IOR('d', 24, uint32_t)
+#define DKIOCGETBLOCKCOUNT _IOR('d', 25, uint64_t)
 
 #ifndef HFSIOC_RESIZE_VOLUME
 #define HFSIOC_RESIZE_VOLUME _IOW('h', 2, u_int64_t)
