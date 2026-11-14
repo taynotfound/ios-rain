@@ -5,10 +5,12 @@ Subject: [PATCH] rain-1009: a soft chord instead of the 1 kHz test tone
 
 adsp_tone=N played a 1 kHz near-square wave that hurt. Now an F major
 chord (F3 C4 F4 A4 C5) with a 20 ms fade-in and ~3 s decay, peak half
-of full scale, integer only (sine table + phase accumulators).
+of full scale, integer only (sine table + phase accumulators). Each note
+has its 2nd and 3rd harmonic: the phone speaker hardly plays the low
+fundamentals.
 ---
 diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
-index 7e6337f..76a68b8 100644
+index 7e6337f..8687266 100644
 --- a/iokit/Kernel/arm/TopazAudio.cpp
 +++ b/iokit/Kernel/arm/TopazAudio.cpp
 @@ -2045,15 +2045,48 @@ apr_pump(void)
@@ -62,7 +64,7 @@ index 7e6337f..76a68b8 100644
  	int16_t buf[480 * 2];
  
  	if (tone_end_ms == 0) {
-@@ -2064,11 +2097,27 @@ apr_tone_feed(void)
+@@ -2064,11 +2097,31 @@ apr_tone_feed(void)
  		LOG("t=%u.%03u tone: done (%u buffers sent, %u done)", T, apr_wsent, apr_wdone);
  		return;
  	}
@@ -78,9 +80,13 @@ index 7e6337f..76a68b8 100644
 +			uint64_t n = tone_frames + f;
 +			int64_t mix = 0;
 +			for (int i = 0; i < 5; i++) {
-+				uint32_t idx = phase[i] >> 24, frac = (phase[i] >> 16) & 0xff;
-+				int32_t a = chime_sin[idx], b = chime_sin[idx + 1];
-+				mix += (int64_t)chime_gain[i] * (a + (((b - a) * (int32_t)frac) >> 8));
++				/* fundamental plus 2nd and 3rd harmonic (weights 4:3:2): a phone speaker hardly plays
++				 * below 500 Hz, the overtones carry the low notes (the ear fills in the fundamental) */
++				for (uint32_t h = 1; h <= 3; h++) {
++					uint32_t ph = phase[i] * h, idx = ph >> 24, frac = (ph >> 16) & 0xff;
++					int32_t a = chime_sin[idx], b = chime_sin[idx + 1];
++					mix += (int64_t)chime_gain[i] * (int32_t)(6 - h) * (a + (((b - a) * (int32_t)frac) >> 8)) / 9;
++				}
 +				phase[i] += chime_inc[i];
 +			}
 +			if (n < 960) {
