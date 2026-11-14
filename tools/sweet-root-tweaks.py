@@ -11,8 +11,7 @@ screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC); bluetoothd
-                  removed too on rain (no BT driver: crash loop, About hangs)
+                  crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -65,12 +64,20 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    # rain: bluetoothd crash-loops without a Bluetooth driver and Settings > About hangs on it
-    removed = [k for k, j in jobs.items() if j.get('Label') in ('com.apple.CommCenter', 'com.apple.bluetoothd')]
+    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
     for k in removed:
         del jobs[k]
+    # rain: removing bluetoothd (About hangs on its crash loop) left SpringBoard spinning at the Apple
+    # logo: put Apple's job back (saved from the IPSW's launchd.plist, not in git)
+    ref = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../build-rain/work/bluetoothd-job.plist')
+    if not any(j.get('Label') == 'com.apple.bluetoothd' for j in jobs.values()):
+        if os.path.exists(ref):
+            jobs[load(ref)['key']] = load(ref)['job']
+            print('launchd.plist: bluetoothd job restored')
+        else:
+            print(f'warning: bluetoothd job missing and no {ref}')
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter/bluetoothd jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
 
 
 def containers(root):
