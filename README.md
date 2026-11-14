@@ -3,9 +3,10 @@
 **Apple's XNU kernel and the iOS 16.7.16 userland of the iPhone X, booting on a Xiaomi Redmi 10C**
 (`rain`, Xiaomi ROM family `fog`; Qualcomm **SM6225 "khaje"** / Snapdragon 680, 720×1650 panel, 4 GB RAM).
 
-As of **2026-11-11** the phone boots **on its own** into the **iOS home screen**, with **touch**, volume
-and lock keys, and the **Adreno GPU drawing the interface**. It is still slow (about 15 frames a second)
-and has no sound or battery reading yet. This is an experiment, not a usable phone OS.
+As of **2026-11-14** the phone boots into the **iOS home screen** with **touch**, the volume and lock
+keys, the **Adreno GPU drawing the interface at 36–49 frames a second**, **sound through the speaker**,
+the **battery level**, **vibration** and the **clock**. Wi-Fi, brightness, Settings > About and
+Settings > Date & Time do not work yet. This is an experiment, not a usable phone OS.
 
 Website: **<https://taynotfound.github.io/ios-rain/>**
 
@@ -36,22 +37,29 @@ values in the shim and `tools/mkadt.py`, `build-rain/`, and the porting log
 
 | Area | State |
 | --- | --- |
-| Boot | Works, **without a PC**: stock Xiaomi ABL boots the shim (boot image v4) from `boot_a`, which starts XNU on Gold core `0x100`. The bootloader does not count down retries for slot a, so it keeps booting iOS |
+| Boot | Works, **without a PC**: stock Xiaomi ABL boots the shim (boot image v4) from `boot_a`, which starts XNU on Gold core `0x100`. The bootloader does not count down retries for slot a. `boot_a` still holds an image from 2026-11-12; today's fixes are tested with `fastboot boot` only |
 | CPU | The four Cortex-A73 cores (`cpus=4`) |
-| Memory | 2 GiB for the kernel (the `0xC0000000` bank, `build-rain/rain-ios-2g.adt`); `0x90000000`–`0xC0000000` is the GPU's pool (0985) |
-| Storage | Works. UFS at `0x4804000`; the iOS root is an HFS+ volume in `userdata` |
-| iOS userland | Works. iPhone X 16.7.16 (20H392) root; lock screen, home screen, Settings. A fresh first boot sits on the Apple logo for 15+ minutes |
-| Display | Works with `sweetfb_noshadow=1 sweetfb_fit=2`: the 1125×2436 iPhone X canvas is stretched to the whole 720×1650 panel, 5.8 % taller than its true shape (0992, not yet tested; `sweetfb_fit=1` keeps its shape with 45-pixel bars above and below). The CPU does that scaling: ~66 ms a frame, the main reason it is slow. The display controller's own scaler (`qseedv3lite`) can do it instead: `sweetfb_hwscale=1` (0994, not yet tested) |
-| GPU | Works (`gpu=1 gpu_mhz=600`): Adreno 610 through Mesa freedreno (user space built by `.github/workflows/userland.yml`, installed with `build-rain/install-gpu-root.sh`) |
-| Touch | Works (patches 0962–0984), also after locking and unlocking. Novatek NT36525B over SPI through GPI DMA; the driver uploads Xiaomi's firmware at boot and again whenever the panel wakes |
-| Keys | Volume and lock keys work. Volume up + down for 3 s reboots into fastboot (0989, not yet tested) |
-| Live log | Works: `sweetusb=2` makes the phone a USB network device that streams the kernel log (0988, see below) |
-| Charging | Plugged-in and charging state from the SMB1351 charger (0993, not yet tested) |
-| Battery | Not yet: the gauge is not where it is on the Note 12, so iOS shows a fixed 100 %. 0989/0991 look for it on both I2C buses (not yet tested). Charging works on the charger chip's own defaults |
-| Vibration | Driver written (0991, GPIO 36), not yet tested |
-| Audio | Not yet. Speaker amp (AW87390) driver and firmware lookup are written (0990); the audio DSP runs Qualcomm's older APR protocol, which needs its own driver |
-| Wi-Fi | Not yet |
-| Cellular, Bluetooth, camera, sensors | Not planned / not started |
+| Memory | 2 GiB for the kernel (the `0xC0000000` bank, `build-rain/rain-ios-2g.adt`); GPU pool below it (0985), modem pool at `0xBC000000` (0999); 64 MB for device mappings (1008) |
+| Storage | Works. UFS at `0x4804000`; the iOS root is a 16 GB HFS+ volume in `userdata` (the partition has ~100 GB, so iOS shows little free space for now) |
+| iOS userland | Works. iPhone X 16.7.16 (20H392) root; lock screen, home screen, Settings. The first boot after flashing `userdata` sits on the Apple logo for about 15 minutes. **Settings > General > About hangs** (bluetoothd crash-loops: no Bluetooth driver) and **Settings > Date & Time crashes** |
+| Display | Works: `sweetfb_fit=3` scales the 1125×2436 canvas to 740×1650 and cuts 10 columns off each side; `sweetfb_hwscale=1` does it in the display controller's own scaler (no CPU copy, 1006) |
+| GPU | Works (`gpu=1 gpu_mhz=600`): Adreno 610 through Mesa freedreno (user space built by `.github/workflows/userland.yml`, installed with `build-rain/install-gpu-root.sh`). **36–49 fps** |
+| Touch | Works (0962–0984), also after locking and unlocking. Novatek NT36525B over SPI through GPI DMA; Xiaomi's firmware uploaded at boot and on every panel wake |
+| Keys | Volume and lock keys work. Volume up + down for 3 s reboots into fastboot (0989) |
+| Clock | Works (1006): the PM6125 RTC plus boot arg `rtc_off` (the RTC is read-only to Linux/XNU and resets when the battery runs flat). The timezone is still the iPhone default (US Pacific) |
+| Live log | Works: `sweetusb=2` (from `fastboot boot`) or `sweetusb=3` (also powers USB up itself, for boots from `boot_a`, 1006/1007) makes the phone a USB network device that streams the kernel log |
+| Battery | Works: SH366101 gauge at SE1 `0x55` (level, voltage, current, temperature; 0997–1002) |
+| Charging | Works: SMB1351 charger, high-current mode on wall chargers (1001); a PC port stays at 500 mA |
+| Vibration | Works (GPIO 36, 0991) |
+| Audio | **Works** with `adsp=1`: rain's own ADSP firmware (APR/Elite), AFE, SoundWire codec, AW87390 amp (0990, 1003, 1008), iOS through the RedwoodAudio HAL plug-in and Apple's VirtualAudio router. `adsp_tone=N` plays a test chime at boot (1009) |
+| Brightness | Driver written (1004, `sweetbl=1`), not yet tested |
+| Wi-Fi | Not yet: WCN3950; topaz's modem/WLFW code is in the tree, the plan is in [docs/CONNECTIVITY-rain.md](docs/CONNECTIVITY-rain.md) |
+| Cellular, Bluetooth, camera, sensors | Not started (sensors: [docs/SENSORS-rain.md](docs/SENSORS-rain.md)) |
+
+### Next
+
+Wi-Fi; brightness (test 1004); Settings > About (stop bluetoothd's crash loop) and Date & Time; a
+bigger iOS volume; the final kernel in `boot_a` with sound, clock and USB power-up.
 
 Security is off, as upstream: permissive AMFI and sandbox, no data protection.
 
@@ -91,11 +99,15 @@ That downloads the kernel from the run, packs it with the device tree and boot a
 `fastboot flash boot_a <image> && fastboot set_active a`. To get back to TWRP: `fastboot set_active b`.
 
 The iOS root image is built from Apple's IPSW with `build-rain/build-iosroot.sh`, gets the GPU user space
-with `sudo build-rain/install-gpu-root.sh`, and is flashed with `fastboot -S 256M flash userdata`.
+and audio plug-in with `sudo build-rain/install-gpu-root.sh` and the bring-up tweaks with
+`sudo build-rain/apply-root-tweaks.sh` (in that order), and is flashed with `fastboot -S 256M flash userdata`.
+
+The boot arguments in use: `sweetfb_fit=3 sweetfb_hwscale=1 gpu=1 gpu_mhz=600 sweetfb_hz=60 adsp=1
+sweetusb=3 rtc_off=<seconds>` (on top of the fixed ones in `build-rain/boot-probe.sh`).
 
 ### Live kernel log over USB
 
-Boot with `sweetusb=2`. The phone appears as USB device `1209:0001` and sends its log to `192.168.7.1`,
+Boot with `sweetusb=2` (or `sweetusb=3` from `boot_a`). The phone appears as USB device `1209:0001` and sends its log to `192.168.7.1`,
 UDP port 5140. On the PC, once: a NetworkManager profile that gives the phone's link (MAC
 `02:00:5e:77:ee:01`) the address `192.168.7.1/24`, and a firewall rule for UDP 5140 on that link.
 Then:
