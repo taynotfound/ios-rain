@@ -134,16 +134,26 @@ def audio(root):
 ZONE = 'Europe/Berlin'      # rain: the owner's zone; Settings > Date & Time crashes, so it cannot be picked there
 
 
+def inside(root, path, depth=0):
+    """The host path of `path` inside the image, following the image's own links (absolute ones from its root)."""
+    parts, cur = [p for p in path.split('/') if p], root
+    for i, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur) and depth < 16:
+            target = os.readlink(cur)
+            base = '' if target.startswith('/') else os.path.relpath(os.path.dirname(cur), root)
+            rest = '/'.join(parts[i + 1:])
+            return inside(root, '/'.join(x for x in (base, target.lstrip('/'), rest) if x and x != '.'), depth + 1)
+    return cur
+
+
 def timezone(root):
     """Point /var/db/timezone/localtime at ZONE, in the same zoneinfo tree the image already uses."""
     link = os.path.join(root, 'private/var/db/timezone/localtime')
     old = os.readlink(link) if os.path.islink(link) else None
     base = old.split('zoneinfo/')[0] + 'zoneinfo/' if old and 'zoneinfo/' in old else '/usr/share/zoneinfo/'
     target = base + ZONE
-    inside = target.lstrip('/')
-    if inside.startswith('var/'):       # /var is a link to private/var: resolve it inside the image, not on the PC
-        inside = 'private/' + inside
-    if not os.path.exists(os.path.join(root, inside)):
+    if not os.path.isfile(inside(root, target)):
         print(f'warning: timezone {target} not in the image (localtime stays {old})')
         return
     os.makedirs(os.path.dirname(link), exist_ok=True)
@@ -151,7 +161,6 @@ def timezone(root):
         os.remove(link)
     os.symlink(target, link)
     print(f'timezone: localtime {old} -> {target}')
-
 
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
